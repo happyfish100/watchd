@@ -1,0 +1,106 @@
+#!/bin/bash
+#set -x
+
+if [ `whoami` != root ]; then
+    echo 'permission denied. should be root'
+    exit 1
+fi
+
+if [ x$2 = x ] || ( [ x$1 != xadd ] && [ x$1 != xdel ] ) ; then
+
+    echo "usage $0 add <service-name>"
+    echo "      $0 del <service-name>"
+    exit 1
+fi
+
+sname=$2
+fname=watchd-$sname
+svcfile=/etc/init.d/$fname
+
+if [ x$1 = xdel ]; then
+    chkconfig --del $fname
+    rm -f $svcfile
+    exit 0
+fi
+
+if [ -e $svcfile ]; then
+    echo "service $fname exists. please del first"
+    exit 1
+fi
+
+touch $svcfile
+chmod 755 $svcfile
+
+CONFIGFILE=/etc/watchd/$fname.conf
+OPTIONS=" $CONFIGFILE"
+prog=/usr/bin/watchd
+
+cat > /etc/init.d/$fname << EOF
+#!/bin/bash
+
+# chkconfig: 2345 99 15
+# description: php service framework $sname
+# processname: $fname
+# config: /etc/watchd/$fname.conf
+
+# Source function library.
+[ -e /etc/init.d/functions ] && source /etc/init.d/functions
+
+# Source networking configuration.
+[ -e /etc/sysconfig/network ] && source /etc/sysconfig/network
+
+CONFIGFILE=" /etc/watchd/$fname.conf"
+OPTIONS=" $CONFIGFILE"
+prog=/usr/bin/watchd
+
+start() {
+    [ "\$NETWORKING" = "no" ] && exit 1
+
+        # Start daemons.
+        echo -n $"Starting $prog for $sname: "
+        $prog $OPTIONS start
+    RETVAL=\$?
+    [ \$RETVAL -eq 0 ] && echo "OK"
+    return \$RETVAL
+}
+
+stop() {
+        echo -n $"Shutting down $prog for $sname: "
+    $prog $OPTIONS stop
+    RETVAL=\$?
+    [ \$RETVAL -eq 0 ] && echo "OK"
+    return \$RETVAL
+}
+
+restart() {
+        echo -n $"Restarting $prog for $sname: "
+    $prog $OPTIONS restart
+    echo 
+    RETVAL=\$?
+    [ \$RETVAL -eq 0 ] && echo "OK"
+    return \$RETVAL
+}
+
+# See how we were called.
+case "\$1" in
+  start)
+    start
+    ;;
+  stop)
+    stop
+    ;;
+  restart)
+    restart
+    ;;
+  status)
+    status -p /home/y/var/watchd/$fname.pid
+    ;;
+  *)
+    echo $"Usage: $fname {start|stop|restart|status}"
+    exit 2
+esac
+
+EOF
+
+chkconfig --add $fname
+chkconfig $fname on
