@@ -1,0 +1,5 @@
+
+watchd is a process watch dog to keep the watched processes alive.
+
+the sample config file please see src/sample.conf.
+

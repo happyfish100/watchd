@@ -17,7 +17,7 @@ LIBS=''
 uname=$(uname)
 if [ "$uname" = "Linux" ]; then
   CFLAGS="$CFLAGS"
-elif [ "$uname" = "FreeBSD" ]; then
+elif [ "$uname" = "FreeBSD" ] || [ "$uname" = "Darwin" ]; then
   CFLAGS="$CFLAGS"
 elif [ "$uname" = "SunOS" ]; then
   CFLAGS="$CFLAGS -D_THREAD_SAFE"

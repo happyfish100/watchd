@@ -54,20 +54,35 @@ static int setup_schedule_tasks();
 static int make_dir(const char* dirname);
 static int load_from_conf_file(const char* filename);
 
+typedef enum { hc_type_none, hc_type_kill, hc_type_exec, hc_type_library } HealthCheckType;
+
+typedef int (*health_check_func)(int count, ...);
+
+typedef struct command_entry {
+    char *cmd;  //command
+    struct {
+        char *cmd;
+        HealthCheckType type;
+        health_check_func func;
+    } health_check;
+} CommandEntry;
+
 typedef struct child_process_info {
     int pid;
     bool running;
     char mode;  //run mode
     bool enable_access_log;
-    int64_t lastStart;
-    int restartInterval;
-    char* logfile;
-    char* acclog;
+    int64_t last_start_time_ms;
+    int last_check_alive_time;
+    int restart_interval_ms;
+    int check_alive_interval;
+    char *logfile;
+    char *acclog;
     struct command_array {
         int alloc;   //alloc count
         int count;   //item count
         int index;   //current index
-        char **list;
+        CommandEntry *list;
     } commands;
 } ChildProcessInfo;
 
@@ -126,6 +141,7 @@ int main(int argc, char* argv[])
         return result;
     }
 
+    g_current_time = time(NULL);
     log_init2();
     log_set_fd_flags(&g_log_context, O_CLOEXEC);
     log_set_rotate_time_format(&g_log_context, "%Y%m%d");
@@ -331,7 +347,7 @@ static int make_dir(const char* dirname)
 static int check_alloc_command_array(struct command_array *commands,
         const int inc_count)
 {
-     char **list;
+     CommandEntry *list;
      int bytes;
      int alloc_size;
      if (commands->alloc > commands->count + inc_count) {
@@ -343,8 +359,8 @@ static int check_alloc_command_array(struct command_array *commands,
          alloc_size *= 2;
      }
 
-     bytes = sizeof(char *) * alloc_size;
-     list = (char **)malloc(bytes);
+     bytes = sizeof(CommandEntry) * alloc_size;
+     list = (CommandEntry *)malloc(bytes);
      if (list == NULL) {
          logError("file: "__FILE__", line: %d, malloc %d bytes fail",
                  __LINE__, bytes);
@@ -353,7 +369,7 @@ static int check_alloc_command_array(struct command_array *commands,
 
      memset(list, 0, bytes);
      if (commands->count > 0) {
-         memcpy(list, commands->list, sizeof(char *) * commands->count);
+         memcpy(list, commands->list, sizeof(CommandEntry) * commands->count);
      }
 
      if (commands->list != NULL) {
@@ -366,7 +382,7 @@ static int check_alloc_command_array(struct command_array *commands,
 
 static inline char *get_current_command(ChildProcessInfo* proc)
 {
-    return proc->commands.list[proc->commands.index];
+    return proc->commands.list[proc->commands.index].cmd;
 }
 
 static inline char *get_next_command(ChildProcessInfo* proc)
@@ -378,7 +394,7 @@ static inline char *get_next_command(ChildProcessInfo* proc)
         }
     }
 
-    return proc->commands.list[proc->commands.index];
+    return proc->commands.list[proc->commands.index].cmd;
 }
 
 static int process_info_cmp_pid(const void *p1, const void *p2)
@@ -428,6 +444,7 @@ static ChildProcessInfo *malloc_process_entry(ChildProcessArray *processArray)
 
     process = (ChildProcessInfo *)fast_mblock_alloc_object(&process_mblock);
     if (process != NULL) {
+        memset(process, 0, sizeof(ChildProcessInfo));
         processArray->processes[processArray->count++] = process;
     }
     return process;
@@ -591,17 +608,20 @@ static int ini_section_load(const int index, const HashData *data, void *args)
         const char* cmd = NULL;
         char *type;
         char *mode;
+        char *check_alive_command;
         char *time_base;
         int cnum = subprocess_number;
-        int restartInterval = restart_interval_ms;
-        int repeatInterval;
+        int new_restart_interval_ms = restart_interval_ms;
+        int new_check_alive_interval = check_alive_interval;
+        int repeat_interval;
         bool enableAccessLog = enable_access_log;
 
 
         type = NULL;
         mode = NULL;
+        check_alive_command = NULL;
         time_base = NULL;
-        repeatInterval = 86400;
+        repeat_interval = 86400;
         pItemEnd = pSection->items + pSection->count;
         for (pItem=pSection->items; pItem<pItemEnd; pItem++) {
             if (strcmp(pItem->name, "subprocess_command") == 0) {
@@ -609,7 +629,11 @@ static int ini_section_load(const int index, const HashData *data, void *args)
             } else if (strcmp(pItem->name, "subprocess_number") == 0) {
                 cnum = atoi(pItem->value);
             } else if (strcmp(pItem->name, "restart_interval_ms") == 0) {
-                restartInterval = atoi(pItem->value);
+                new_restart_interval_ms = atoi(pItem->value);
+            } else if (strcmp(pItem->name, "check_alive_interval") == 0) {
+                new_check_alive_interval = atoi(pItem->value);
+            } else if (strcmp(pItem->name, "check_alive_command") == 0) {
+                check_alive_command = pItem->value;
             } else if (strcmp(pItem->name, "type") == 0) {
                 type = pItem->value;
             } else if (strcmp(pItem->name, "mode") == 0) {
@@ -617,13 +641,13 @@ static int ini_section_load(const int index, const HashData *data, void *args)
             } else if (strcmp(pItem->name, "time_base") == 0) {
                 time_base = pItem->value;
             } else if (strcmp(pItem->name, "repeat_interval") == 0) {
-                repeatInterval = atoi(pItem->value);
-                if (repeatInterval <= 0) {
-                    repeatInterval = 86400;
+                repeat_interval = atoi(pItem->value);
+                if (repeat_interval <= 0) {
+                    repeat_interval = 86400;
                     logWarning("file: "__FILE__", line: %d, "
                             "invalid repeat_interval for section %s, "
                             "set to %d", __LINE__,
-                            section_name, repeatInterval);
+                            section_name, repeat_interval);
                 }
             } else if (strcmp(pItem->name, "enable_access_log") == 0) {
                 enableAccessLog = FAST_INI_STRING_IS_TRUE(pItem->value);
@@ -653,16 +677,16 @@ static int ini_section_load(const int index, const HashData *data, void *args)
             if (check_alloc_command_array(&cpro->commands, 1) != 0) {
                 return ENOMEM;
             }
-            cpro->commands.list[0] = strdup(cmd);
+            cpro->commands.list[0].cmd = strdup(cmd);
             cpro->commands.count = 1;
             cpro->logfile = strdup(logfiles_all[logfiles_count]);
             cpro->acclog = strdup(acclogs_all[logfiles_count]);
             cpro->mode = MODE_ALL;
             cpro->enable_access_log = enableAccessLog;
-            return add_cron_entry(cpro, time_base, repeatInterval);
+            return add_cron_entry(cpro, time_base, repeat_interval);
         }
 
-        if (cnum > 0 && restartInterval >= 0) {
+        if (cnum > 0 && new_restart_interval_ms >= 0) {
             for (i = 0; i < cnum; i ++) {
                 ChildProcessInfo* cpro;
                 cpro = malloc_child_process_entry();
@@ -678,11 +702,19 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 } else {
                     cpro->mode = MODE_ALL;
                 }
-                cpro->commands.list[0] = strdup(cmd);
+                cpro->commands.list[0].cmd = strdup(cmd);
+
+                if (new_check_alive_interval > 0) {
+                    if (check_alive_command != NULL) {
+                        cpro->commands.list[0].health_check.cmd = strdup(check_alive_command);
+                    }
+                }
+
                 cpro->commands.count = 1;
                 cpro->logfile = logfiles_all[logfiles_count];
                 cpro->acclog = acclogs_all[logfiles_count];
-                cpro->restartInterval = restartInterval;
+                cpro->restart_interval_ms = new_restart_interval_ms;
+                cpro->check_alive_interval = new_check_alive_interval;
                 cpro->enable_access_log = enableAccessLog;
                 if (child_proc_array.count >= MAX_CHILD_PROCESS) {
                     logError("file: "__FILE__", line: %d, "
@@ -696,7 +728,7 @@ static int ini_section_load(const int index, const HashData *data, void *args)
             logError("file: "__FILE__", line: %d, invalid config "
                     "for section %s subprocess_command: %s"
                     " subprocess_number: %d restart_interval_ms %d",
-                    __LINE__, section_name, cmd, cnum, restartInterval);
+                    __LINE__, section_name, cmd, cnum, new_restart_interval_ms);
             return EINVAL;
         }
     }
@@ -812,7 +844,7 @@ static int expand_cmd(IniContext* iniContext, ChildProcessInfo *cpro,
     int cmd_len;
     int front_len;
 
-    cmd = cpro->commands.list[0];
+    cmd = cpro->commands.list[0].cmd;
     cmd_len = strlen(cmd);
     pdollar = (char*)strchr(cmd, '$');
     if (pdollar == NULL) { //no need to expand
@@ -872,15 +904,15 @@ static int expand_cmd(IniContext* iniContext, ChildProcessInfo *cpro,
             if (check_alloc_command_array(&lpro->commands, 1) != 0) {
                 return ENOMEM;
             }
-            lpro->commands.list[0] = malloc(cmd_len + strlen(params[i]) + 1);
-            if (lpro->commands.list[0] == NULL) {
+            lpro->commands.list[0].cmd = malloc(cmd_len + strlen(params[i]) + 1);
+            if (lpro->commands.list[0].cmd == NULL) {
                 logError("file: "__FILE__", line: %d, malloc %d bytes fail",
                         __LINE__, (int)(cmd_len + strlen(params[i])) + 1);
                 return ENOMEM;
             }
             lpro->commands.count = 1;
-            memcpy(lpro->commands.list[0], cmd, front_len);
-            sprintf(lpro->commands.list[0] + front_len, "%s", params[i]);
+            memcpy(lpro->commands.list[0].cmd, cmd, front_len);
+            sprintf(lpro->commands.list[0].cmd + front_len, "%s", params[i]);
 
             if (processes != NULL) {
                 processes[i] = lpro;
@@ -896,14 +928,15 @@ static int expand_cmd(IniContext* iniContext, ChildProcessInfo *cpro,
             return ENOMEM;
         }
         for (i=1; i<count; i++) {
-            cpro->commands.list[i] = malloc(cmd_len + strlen(params[i]) + 1);
-            if (cpro->commands.list[i] == NULL) {
+            cpro->commands.list[i].cmd = malloc(cmd_len + strlen(params[i]) + 1);
+            if (cpro->commands.list[i].cmd == NULL) {
                 logError("file: "__FILE__", line: %d, malloc %d bytes fail",
                         __LINE__, (int)(cmd_len + strlen(params[i])) + 1);
                 return ENOMEM;
             }
-            memcpy(cpro->commands.list[i], cmd, front_len);
-            sprintf(cpro->commands.list[i] + front_len, "%s", params[i]);
+            memcpy(cpro->commands.list[i].cmd, cmd, front_len);
+            sprintf(cpro->commands.list[i].cmd + front_len, "%s", params[i]);
+            cpro->commands.list[i].health_check.cmd = cpro->commands.list[0].health_check.cmd;
         }
         cpro->commands.count = count;
         if (processes != NULL) {
@@ -920,8 +953,8 @@ static int expand_cmd(IniContext* iniContext, ChildProcessInfo *cpro,
     }
     memcpy(new_cmd, cmd, front_len);
     sprintf(new_cmd + front_len, "%s", params[0]);
-    free(cpro->commands.list[0]);
-    cpro->commands.list[0] = new_cmd;
+    free(cpro->commands.list[0].cmd);
+    cpro->commands.list[0].cmd = new_cmd;
 
     return 0;
 }
@@ -984,17 +1017,20 @@ static int load_from_conf_file(const char* filename)
         subprocess_number = 1;
     }
 
-    wait_subprocess_ms = iniGetIntValue(NULL, "wait_subprocess_ms", &iniContext, DEFAULT_WAIT_SUBPROCESS);
+    wait_subprocess_ms = iniGetIntValue(NULL, "wait_subprocess_ms",
+            &iniContext, DEFAULT_WAIT_SUBPROCESS);
     if (wait_subprocess_ms <= 0) {
         wait_subprocess_ms = DEFAULT_WAIT_SUBPROCESS;
     }
 
-    restart_interval_ms = iniGetIntValue(NULL, "restart_interval_ms", &iniContext, DEFAULT_RESTART_INTERVAL);
+    restart_interval_ms = iniGetIntValue(NULL, "restart_interval_ms",
+            &iniContext, DEFAULT_RESTART_INTERVAL);
     if (restart_interval_ms < 0) {
         restart_interval_ms = DEFAULT_RESTART_INTERVAL;
     }
 
-    check_alive_interval = iniGetIntValue(NULL, "check_alive_interval", &iniContext, DEFAULT_RESTART_INTERVAL);
+    check_alive_interval = iniGetIntValue(NULL, "check_alive_interval",
+            &iniContext, DEFAULT_CHECK_ALIVE_INTERVAL);
     if (check_alive_interval < 0) {
         check_alive_interval = DEFAULT_CHECK_ALIVE_INTERVAL;
     }
@@ -1158,8 +1194,8 @@ static int start_all_processes()
     now = get_current_time_ms();
     for (i = 0; i < child_proc_array.count; i++) {
         if (!child_proc_array.processes[i]->running
-                && now - child_proc_array.processes[i]->lastStart >=
-                child_proc_array.processes[i]->restartInterval)
+                && now - child_proc_array.processes[i]->last_start_time_ms >=
+                child_proc_array.processes[i]->restart_interval_ms)
         {
             result = start_process(child_proc_array.processes[i]);
             if (result != 0) {
@@ -1167,7 +1203,7 @@ static int start_all_processes()
             }
 
             child_proc_array.processes[i]->running = true;
-            child_proc_array.processes[i]->lastStart = get_current_time_ms();
+            child_proc_array.processes[i]->last_start_time_ms = get_current_time_ms();
             child_running++;
             logInfo("file: "__FILE__", line: %d, process %d started. "
                     "running %d processes. %s %s", __LINE__,
@@ -1235,25 +1271,30 @@ static void check_subproccess_alive()
 {
     int i;
 
-    if (check_alive_interval == 0 || child_running <= 0 ||
-            last_check_alive_time  + check_alive_interval > g_current_time)
-    {
+    if (child_running <= 0 || last_check_alive_time >= g_current_time) {
         return;
     }
     last_check_alive_time = g_current_time;
 
     for (i = 0; i < child_proc_array.count; i++) {
         ChildProcessInfo* child = child_proc_array.processes[i];
-        if (child->pid > 0 && child->running) {
-            if (kill(child->pid, 0) != 0) {
-                child->running = false;
-                child_running--;
-                logInfo("file: "__FILE__", line: %d, process %d "
-                        "already exited. errno: %d, error info: %s, "
-                        "running %d processes. %s", __LINE__,
-                        child->pid, errno, strerror(errno),
-                        child_running, get_current_command(child));
-            }
+        if (!(child->pid > 0 && child->running && child->check_alive_interval > 0)) {
+            continue;
+        }
+
+        if (child->last_check_alive_time + child->check_alive_interval > g_current_time) {
+            continue;
+        }
+
+        child->last_check_alive_time = g_current_time;
+        if (kill(child->pid, 0) != 0) {
+            child->running = false;
+            child_running--;
+            logInfo("file: "__FILE__", line: %d, process %d "
+                    "already exited. errno: %d, error info: %s, "
+                    "running %d processes. %s", __LINE__,
+                    child->pid, errno, strerror(errno),
+                    child_running, get_current_command(child));
         }
     }
 }
