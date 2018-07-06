@@ -54,14 +54,17 @@ static int setup_schedule_tasks();
 static int make_dir(const char* dirname);
 static int load_from_conf_file(const char* filename);
 
-typedef enum { hc_type_none, hc_type_kill, hc_type_exec, hc_type_library } HealthCheckType;
+typedef enum { hc_type_none=0, hc_type_kill,
+    hc_type_exec, hc_type_library } HealthCheckType;
 
-typedef int (*health_check_func)(int count, ...);
+typedef int (*health_check_func)(int argc, char **argv);
 
 typedef struct command_entry {
-    char *cmd;  //command
-    struct {
-        char *cmd;
+    char *cmd;  //exec command
+    struct health_check_entry {
+        char *cmd;    //check command
+        int argc;
+        char **argv;
         HealthCheckType type;
         health_check_func func;
     } health_check;
@@ -171,6 +174,8 @@ int main(int argc, char* argv[])
         return result;
     }
 
+    logInfo("file: %s, line: %d", __FILE__, __LINE__);
+
     if ((result=process_action(pidfile, action, &stop)) != 0) {
         if (result == EINVAL) {
             usage(argv[0]);
@@ -183,6 +188,7 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     if ((result=set_run_by(run_by_group, run_by_user)) != 0) {
         logCrit("file: "__FILE__", line: %d, "
             "call set set_run_by fail, exit!", __LINE__);
@@ -193,13 +199,16 @@ int main(int argc, char* argv[])
     umask(0);
 
     log_set_use_file_write_lock(true);
+    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     if ((result=log_set_filename(logfile)) != 0) {
         logCrit("file: "__FILE__", line: %d, "
             "call set log_set_filename fail, exit!", __LINE__);
         return result;
     }
+    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     close(0);
 
+    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     if ((result=write_to_pid_file(pidfile)) != 0) {
         log_destroy();
         return result;
@@ -207,12 +216,15 @@ int main(int argc, char* argv[])
     setup_sig_handlers();
     setup_schedule_tasks();
 
+    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     if ((result=add_shedule_entries(configfile)) != 0) {
         return result;
     }
+    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     if ((result = start_all_processes()) != 0) {
         return result;
     }
+    logInfo("file: %s, line: %d", __FILE__, __LINE__);
 
     last_check_alive_time = g_current_time;
     logInfo("file: "__FILE__", line: %d, %s started, "
@@ -380,6 +392,11 @@ static int check_alloc_command_array(struct command_array *commands,
      return 0;
 }
 
+static inline CommandEntry *get_current_command_entry(ChildProcessInfo* proc)
+{
+    return proc->commands.list + proc->commands.index;
+}
+
 static inline char *get_current_command(ChildProcessInfo* proc)
 {
     return proc->commands.list[proc->commands.index].cmd;
@@ -504,6 +521,8 @@ static int add_shedule_entries(const char* filename)
         return 0;
     }
 
+    logInfo("func: %s, line: %d", __FUNCTION__, __LINE__);
+
     memset(&iniContext, 0, sizeof(IniContext));
     if ((result=iniLoadFromFile(filename, &iniContext)) != 0) {
         logError("file: "__FILE__", line: %d, "
@@ -511,6 +530,8 @@ static int add_shedule_entries(const char* filename)
                 __LINE__, filename, result);
         return result;
     }
+
+    logInfo("func: %s, line: %d", __FUNCTION__, __LINE__);
 
     for (i=0; i<cron_entry_count; i++) {
         pCronEntry = cron_entries + i;
@@ -964,6 +985,38 @@ static int expand_child_cmd(IniContext* iniContext, ChildProcessInfo *cpro)
     return expand_cmd(iniContext, cpro, malloc_child_process_entry, NULL, NULL);
 }
 
+static int parse_check_alive_command(ChildProcessInfo* cpro)
+{
+    int i;
+    struct health_check_entry *health_check;
+
+    for (i=0; i<cpro->commands.count; i++) {
+        health_check = &cpro->commands.list[i].health_check;
+
+        logInfo("cmd: %s", cpro->commands.list[i].cmd);
+        logInfo("check cmd: %s", health_check->cmd);
+    }
+
+    return 0;
+}
+
+static int parse_check_alive_commands()
+{
+    int result;
+    int i;
+    for (i = 0; i < child_proc_array.count; i++) {
+        ChildProcessInfo* child = child_proc_array.processes[i];
+        if (child->check_alive_interval > 0) {
+            result = parse_check_alive_command(child);
+            if (result != 0) {
+                return result;
+            }
+        }
+    }
+
+    return 0;
+}
+
 static int load_from_conf_file(const char* filename)
 {
     IniContext iniContext;
@@ -972,7 +1025,10 @@ static int load_from_conf_file(const char* filename)
     const char* p;
 
     memset(&iniContext, 0, sizeof(IniContext));
-    if ((result=iniLoadFromFile(filename, &iniContext)) != 0) {
+    result = iniLoadFromFileEx(filename, &iniContext,
+            FAST_INI_ANNOTATION_WITH_BUILTIN,
+            NULL, 0, FAST_INI_FLAGS_SHELL_EXECUTE);
+    if (result != 0) {
         logError("file: "__FILE__", line: %d, load conf file %s fail, "
                 "ret code: %d", __LINE__, filename, result);
         return result;
@@ -1051,7 +1107,11 @@ static int load_from_conf_file(const char* filename)
         }
     }
     iniFreeContext(&iniContext);
-    return result;
+    if (result != 0) {
+        return result;
+    }
+
+    return parse_check_alive_commands();
 }
 
 static int setup_schedule_tasks()
@@ -1270,6 +1330,7 @@ static int stop_all_processes()
 static void check_subproccess_alive()
 {
     int i;
+    CommandEntry *cmd_entry;
 
     if (child_running <= 0 || last_check_alive_time >= g_current_time) {
         return;
@@ -1287,14 +1348,18 @@ static void check_subproccess_alive()
         }
 
         child->last_check_alive_time = g_current_time;
-        if (kill(child->pid, 0) != 0) {
-            child->running = false;
-            child_running--;
-            logInfo("file: "__FILE__", line: %d, process %d "
-                    "already exited. errno: %d, error info: %s, "
-                    "running %d processes. %s", __LINE__,
-                    child->pid, errno, strerror(errno),
-                    child_running, get_current_command(child));
+
+        cmd_entry = get_current_command_entry(child);
+        if (cmd_entry->health_check.type == hc_type_kill) {
+            if (kill(child->pid, 0) != 0) {
+                child->running = false;
+                child_running--;
+                logInfo("file: "__FILE__", line: %d, process %d "
+                        "already exited. errno: %d, error info: %s, "
+                        "running %d processes. %s", __LINE__,
+                        child->pid, errno, strerror(errno),
+                        child_running, get_current_command(child));
+            }
         }
     }
 }
