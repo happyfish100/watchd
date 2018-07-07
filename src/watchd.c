@@ -112,14 +112,16 @@ static MqPath* acclogs_all = NULL;
 
 static int logfiles_count = 0;
 
+static IniContext ini_context;
+IniContext *iniContext = &ini_context;
 static int cron_entry_alloc_size = 0;
 static int cron_entry_count = 0;
 static CronEntry *cron_entries = NULL;
 
 typedef ChildProcessInfo* (*malloc_process_func)();
 
-static int expand_cmd(IniContext* iniContext, ChildProcessInfo *cpro,
-        malloc_process_func malloc_func, ChildProcessInfo **processes, int *pnum);
+static int expand_cmd(ChildProcessInfo *cpro, malloc_process_func malloc_func,
+        ChildProcessInfo **processes, int *pnum);
 
 static void usage(const char* program)
 {
@@ -133,7 +135,7 @@ static int stop_all_processes();
 static int rotate_logs();
 static void check_subproccess_alive();
 static int start_process(ChildProcessInfo *process);
-static int add_shedule_entries(const char* filename);
+static int add_shedule_entries();
 
 int main(int argc, char* argv[])
 {
@@ -174,8 +176,6 @@ int main(int argc, char* argv[])
         return result;
     }
 
-    logInfo("file: %s, line: %d", __FILE__, __LINE__);
-
     if ((result=process_action(pidfile, action, &stop)) != 0) {
         if (result == EINVAL) {
             usage(argv[0]);
@@ -188,7 +188,6 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     if ((result=set_run_by(run_by_group, run_by_user)) != 0) {
         logCrit("file: "__FILE__", line: %d, "
             "call set set_run_by fail, exit!", __LINE__);
@@ -199,16 +198,13 @@ int main(int argc, char* argv[])
     umask(0);
 
     log_set_use_file_write_lock(true);
-    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     if ((result=log_set_filename(logfile)) != 0) {
         logCrit("file: "__FILE__", line: %d, "
             "call set log_set_filename fail, exit!", __LINE__);
         return result;
     }
-    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     close(0);
 
-    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     if ((result=write_to_pid_file(pidfile)) != 0) {
         log_destroy();
         return result;
@@ -216,20 +212,21 @@ int main(int argc, char* argv[])
     setup_sig_handlers();
     setup_schedule_tasks();
 
-    logInfo("file: %s, line: %d", __FILE__, __LINE__);
-    if ((result=add_shedule_entries(configfile)) != 0) {
+    if ((result=add_shedule_entries()) != 0) {
         return result;
     }
-    logInfo("file: %s, line: %d", __FILE__, __LINE__);
     if ((result = start_all_processes()) != 0) {
         return result;
     }
-    logInfo("file: %s, line: %d", __FILE__, __LINE__);
 
+    iniFreeContext(iniContext);
     last_check_alive_time = g_current_time;
     logInfo("file: "__FILE__", line: %d, %s started, "
             "running processes count: %d",
             __LINE__, program, child_running);
+
+    sched_print_all_entries();
+
     while (continue_flag) {
         if (restart_subprocess) {
             restart_subprocess = false;
@@ -504,7 +501,7 @@ static int check_alloc_schedule_entries(ScheduleArray *pSheduleArray,
     return 0;
 }
 
-static int add_shedule_entries(const char* filename)
+static int add_shedule_entries()
 {
     ChildProcessInfo *cron_processes[MAX_CHILD_PROCESS];
     ChildProcessInfo *process;
@@ -515,28 +512,15 @@ static int add_shedule_entries(const char* filename)
     int i, k;
     int count;
     int result;
-    IniContext iniContext;
 
     if (cron_entry_count == 0) {
         return 0;
     }
 
-    logInfo("func: %s, line: %d", __FUNCTION__, __LINE__);
-
-    memset(&iniContext, 0, sizeof(IniContext));
-    if ((result=iniLoadFromFile(filename, &iniContext)) != 0) {
-        logError("file: "__FILE__", line: %d, "
-                "load conf file %s fail, ret code: %d",
-                __LINE__, filename, result);
-        return result;
-    }
-
-    logInfo("func: %s, line: %d", __FUNCTION__, __LINE__);
-
     for (i=0; i<cron_entry_count; i++) {
         pCronEntry = cron_entries + i;
         count = 0;
-        result = expand_cmd(&iniContext, cron_proc_array.processes[i],
+        result = expand_cmd(cron_proc_array.processes[i],
                 malloc_cron_process_entry, cron_processes, &count);
         if (result != 0) {
             return result;
@@ -550,14 +534,13 @@ static int add_shedule_entries(const char* filename)
         for (k=0; k<count; k++) {
             process = cron_processes[k];
             pScheduleEntry = shedule_array.entries + shedule_array.count;
-            INIT_SCHEDULE_ENTRY_EX((*pScheduleEntry), 101 + k,
+            INIT_SCHEDULE_ENTRY_EX((*pScheduleEntry), sched_generate_next_id(),
                     pCronEntry->time_base, pCronEntry->interval,
                     schedule_task_func, process);
             shedule_array.count++;
         }
     }
 
-    iniFreeContext(&iniContext);
     if ((result=sched_add_entries(&shedule_array)) != 0) {
         return result;
     }
@@ -844,7 +827,7 @@ static int get_params(char *str, char *out_buff, const int buff_size,
     return splitEx(str, ',', params, max_count);
 }
 
-static int expand_cmd(IniContext* iniContext, ChildProcessInfo *cpro,
+static int expand_cmd(ChildProcessInfo *cpro,
         malloc_process_func malloc_func, ChildProcessInfo **processes, int *pnum)
 {
 #define MAX_PARAMS_COUNT 256
@@ -980,9 +963,9 @@ static int expand_cmd(IniContext* iniContext, ChildProcessInfo *cpro,
     return 0;
 }
 
-static int expand_child_cmd(IniContext* iniContext, ChildProcessInfo *cpro)
+static int expand_child_cmd(ChildProcessInfo *cpro)
 {
-    return expand_cmd(iniContext, cpro, malloc_child_process_entry, NULL, NULL);
+    return expand_cmd(cpro, malloc_child_process_entry, NULL, NULL);
 }
 
 static int parse_check_alive_command(ChildProcessInfo* cpro)
@@ -1019,13 +1002,12 @@ static int parse_check_alive_commands()
 
 static int load_from_conf_file(const char* filename)
 {
-    IniContext iniContext;
     int result;
     int i;
     const char* p;
 
-    memset(&iniContext, 0, sizeof(IniContext));
-    result = iniLoadFromFileEx(filename, &iniContext,
+    memset(iniContext, 0, sizeof(IniContext));
+    result = iniLoadFromFileEx(filename, iniContext,
             FAST_INI_ANNOTATION_WITH_BUILTIN,
             NULL, 0, FAST_INI_FLAGS_SHELL_EXECUTE);
     if (result != 0) {
@@ -1033,17 +1015,17 @@ static int load_from_conf_file(const char* filename)
                 "ret code: %d", __LINE__, filename, result);
         return result;
     }
-    p = iniGetStrValue(NULL, "run_by_group", &iniContext);
+    p = iniGetStrValue(NULL, "run_by_group", iniContext);
     if (p) {
         strcpy(run_by_group, p);
     }
-    p = iniGetStrValue(NULL, "run_by_user", &iniContext);
+    p = iniGetStrValue(NULL, "run_by_user", iniContext);
     if (p) {
         strcpy(run_by_user, p);
     }
-    load_log_level(&iniContext);
+    load_log_level(iniContext);
 
-    p = iniGetStrValue(NULL, "base_path", &iniContext);
+    p = iniGetStrValue(NULL, "base_path", iniContext);
     if (p == NULL || p[0] == '\0') {
         logError("file: "__FILE__", line: %d, base_path should be set",
                 __LINE__);
@@ -1051,7 +1033,7 @@ static int load_from_conf_file(const char* filename)
     } else {
         strcpy(base_path, p);
     }
-    p = iniGetStrValue(NULL, "service_name", &iniContext);
+    p = iniGetStrValue(NULL, "service_name", iniContext);
     if (p == NULL || p[0] == '\0') {
         logError("file: "__FILE__", line: %d, "
                 "service_name should be set in config", __LINE__);
@@ -1063,50 +1045,47 @@ static int load_from_conf_file(const char* filename)
     snprintf(logpath, sizeof logpath, "%s/logs", base_path);
     snprintf(logfile, sizeof logfile, "%s/watchd-%s.log", logpath, service_name);
 
-    log_file_keep_days = iniGetIntValue(NULL, "log_file_keep_days", &iniContext, 0);
+    log_file_keep_days = iniGetIntValue(NULL, "log_file_keep_days", iniContext, 0);
     if (log_file_keep_days < 0) {
         log_file_keep_days = 0;
     }
 
-    subprocess_number = iniGetIntValue(NULL, "subprocess_number", &iniContext, 1);
+    subprocess_number = iniGetIntValue(NULL, "subprocess_number", iniContext, 1);
     if (subprocess_number <= 0) {
         subprocess_number = 1;
     }
 
     wait_subprocess_ms = iniGetIntValue(NULL, "wait_subprocess_ms",
-            &iniContext, DEFAULT_WAIT_SUBPROCESS);
+            iniContext, DEFAULT_WAIT_SUBPROCESS);
     if (wait_subprocess_ms <= 0) {
         wait_subprocess_ms = DEFAULT_WAIT_SUBPROCESS;
     }
 
     restart_interval_ms = iniGetIntValue(NULL, "restart_interval_ms",
-            &iniContext, DEFAULT_RESTART_INTERVAL);
+            iniContext, DEFAULT_RESTART_INTERVAL);
     if (restart_interval_ms < 0) {
         restart_interval_ms = DEFAULT_RESTART_INTERVAL;
     }
 
     check_alive_interval = iniGetIntValue(NULL, "check_alive_interval",
-            &iniContext, DEFAULT_CHECK_ALIVE_INTERVAL);
+            iniContext, DEFAULT_CHECK_ALIVE_INTERVAL);
     if (check_alive_interval < 0) {
         check_alive_interval = DEFAULT_CHECK_ALIVE_INTERVAL;
     }
 
-    enable_access_log = iniGetBoolValue(NULL, "enable_access_log", &iniContext, false);
+    enable_access_log = iniGetBoolValue(NULL, "enable_access_log", iniContext, false);
 
-    logfiles_all = malloc(MAX_PATH_SIZE * iniContext.sections.item_count);
-    acclogs_all = malloc(MAX_PATH_SIZE * iniContext.sections.item_count);
-    if ((result=hash_walk(&iniContext.sections, ini_section_load, NULL)) != 0) {
+    logfiles_all = malloc(MAX_PATH_SIZE * iniContext->sections.item_count);
+    acclogs_all = malloc(MAX_PATH_SIZE * iniContext->sections.item_count);
+    if ((result=hash_walk(&iniContext->sections, ini_section_load, NULL)) != 0) {
         return result;
     }
 
     for (i = child_proc_array.count-1; i >= 0; i--) {
-        if ((result=expand_child_cmd(&iniContext,
-                        child_proc_array.processes[i])) != 0)
-        {
+        if ((result=expand_child_cmd(child_proc_array.processes[i])) != 0) {
             break;
         }
     }
-    iniFreeContext(&iniContext);
     if (result != 0) {
         return result;
     }
@@ -1121,13 +1100,11 @@ static int setup_schedule_tasks()
     ScheduleEntry scheduleEntries[SCHEDULE_ENTRIES_COUNT];
     ScheduleArray scheduleArray;
     ScheduleEntry *pEntry;
-    int count;
 
-    count = 0;
     pEntry = scheduleEntries;
     memset(scheduleEntries, 0, sizeof(scheduleEntries));
 
-    pEntry->id = ++count;
+    pEntry->id = sched_generate_next_id();
     pEntry->time_base.hour = 0;
     pEntry->time_base.minute = 0;
     pEntry->time_base.second = 0;
@@ -1137,10 +1114,9 @@ static int setup_schedule_tasks()
     pEntry++;
 
     scheduleArray.entries = scheduleEntries;
-    scheduleArray.count = count;
+    scheduleArray.count = pEntry - scheduleEntries;
     return sched_start(&scheduleArray, &schedule_tid,
-        64 * 1024, (bool * volatile)
-        &continue_flag);
+        64 * 1024, (bool * volatile)&continue_flag);
 }
 
 static int update_process(int pid, const int status)
