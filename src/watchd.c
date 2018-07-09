@@ -75,10 +75,12 @@ typedef struct child_process_info {
     bool running;
     char mode;  //run mode
     bool enable_access_log;
+    bool run_by_sh;
     int64_t last_start_time_ms;
     int last_check_alive_time;
     int restart_interval_ms;
     int check_alive_interval;
+    uint32_t run_count;
     char *logfile;
     char *acclog;
     struct command_array {
@@ -407,13 +409,14 @@ static inline char *get_current_command(ChildProcessInfo* proc)
 
 static inline char *get_next_command(ChildProcessInfo* proc)
 {
-    if (proc->commands.count > 1) {
+    if (proc->commands.count > 1 && proc->run_count > 0) {
         proc->commands.index++;
         if (proc->commands.index >= proc->commands.count) {
             proc->commands.index = 0;
         }
     }
 
+    proc->run_count++;
     return proc->commands.list[proc->commands.index].cmd;
 }
 
@@ -426,10 +429,11 @@ static int schedule_task_func(void *args)
 {
     ChildProcessInfo *process;
     process = (ChildProcessInfo *)args;
+
+    logInfo("file: "__FILE__", line: %d, run cron process: %s %s",
+            __LINE__, get_current_command(process),
+            process->enable_access_log ? process->acclog : "");
     if (start_process(process) == 0) {
-        logInfo("file: "__FILE__", line: %d, run cron process: %s %s",
-                __LINE__, get_current_command(process),
-                process->enable_access_log ? process->acclog : "");
         if (cron_proc_array.count > 1) {
             qsort(cron_proc_array.processes, cron_proc_array.count,
                     sizeof(ChildProcessInfo *), process_info_cmp_pid);
@@ -593,6 +597,11 @@ static int add_cron_entry(ChildProcessInfo *process,
     return 0;
 }
 
+static inline bool is_run_by_sh(const char *cmd)
+{
+    return (strchr(cmd, '>') != NULL || cmd[strlen(cmd) - 1] == '&');
+}
+
 static int ini_section_load(const int index, const HashData *data, void *args)
 {
     IniSection *pSection;
@@ -665,7 +674,7 @@ static int ini_section_load(const int index, const HashData *data, void *args)
             }
         }
 
-        if (cmd == NULL) {
+        if (cmd == NULL || *cmd == '\0') {
             logError("file: "__FILE__", line: %d, section %s, "
                     "expect subprocess_command", __LINE__, section_name);
             return EINVAL;
@@ -688,6 +697,7 @@ static int ini_section_load(const int index, const HashData *data, void *args)
             if (check_alloc_command_array(&cpro->commands, 1) != 0) {
                 return ENOMEM;
             }
+            cpro->run_by_sh = is_run_by_sh(cmd);
             cpro->commands.list[0].cmd = strdup(cmd);
             cpro->commands.count = 1;
             cpro->logfile = strdup(logfiles_all[logfiles_count]);
@@ -713,6 +723,7 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 } else {
                     cpro->mode = MODE_ALL;
                 }
+                cpro->run_by_sh = is_run_by_sh(cmd);
                 cpro->commands.list[0].cmd = strdup(cmd);
 
                 if (new_check_alive_interval > 0) {
@@ -834,20 +845,20 @@ static int expand_cmd(ChildProcessInfo *cpro,
 {
 #define MAX_PARAMS_COUNT 256
 
-    ;
     char *cmd;
     char *new_cmd;
-    char* pdollar;
-    char* pword;
-    char* pworde;
-    char* confArgs = NULL;
-    char* p = NULL;
+    char *pdollar;
+    char pword[64];
+    char *pworde;
+    char *confArgs;
+    char *tail;
     char args[MAX_PATH_SIZE];
     char *params[MAX_PARAMS_COUNT];
     char out_buff[1024];
     int i;
     int count;
     int cmd_len;
+    int word_len;
     int front_len;
 
     cmd = cpro->commands.list[0].cmd;
@@ -860,24 +871,22 @@ static int expand_cmd(ChildProcessInfo *cpro,
         }
         return 0;
     }
-    pword = pdollar + 1;
-    pworde = pword;
-    while (*pworde && !isspace(*pworde)) {
+    pworde = pdollar + 1;
+    while (*pworde != '\0' && !isspace(*pworde)) {
         pworde++;
     }
 
-    //check the dollar word is the last
-    p = pworde;
-    while (*p && isspace(*p)) {
-        p++;
-    }
-    if (*p && !isspace(*p)) {
-        logError("file: "__FILE__", line: %d, command with dollar "
-                "should be the last parameter. %s", __LINE__, cmd);
+    tail = pworde;
+    word_len = pworde - (pdollar + 1);
+    if (word_len >= sizeof(pword)) {
+        logError("file: "__FILE__", line: %d, key length "
+                "too long, exceeds %d, key: %.*s. in cmd: %s",
+                __LINE__, (int)sizeof(pword), word_len,
+                pdollar + 1, cmd);
         return EINVAL;
     }
 
-    *pworde = '\0';
+    sprintf(pword, "%.*s", word_len, pdollar + 1);
     confArgs = iniGetStrValue(NULL, pword, iniContext);
     if (confArgs == NULL) {
         logError("file: "__FILE__", line: %d, no conf word for "
@@ -918,7 +927,7 @@ static int expand_cmd(ChildProcessInfo *cpro,
             }
             lpro->commands.count = 1;
             memcpy(lpro->commands.list[0].cmd, cmd, front_len);
-            sprintf(lpro->commands.list[0].cmd + front_len, "%s", params[i]);
+            sprintf(lpro->commands.list[0].cmd + front_len, "%s%s", params[i], tail);
 
             if (processes != NULL) {
                 if (i < max_count) {
@@ -947,7 +956,7 @@ static int expand_cmd(ChildProcessInfo *cpro,
                 return ENOMEM;
             }
             memcpy(cpro->commands.list[i].cmd, cmd, front_len);
-            sprintf(cpro->commands.list[i].cmd + front_len, "%s", params[i]);
+            sprintf(cpro->commands.list[i].cmd + front_len, "%s%s", params[i], tail);
             cpro->commands.list[i].health_check.cmd = cpro->commands.list[0].health_check.cmd;
         }
         cpro->commands.count = count;
@@ -964,7 +973,7 @@ static int expand_cmd(ChildProcessInfo *cpro,
         return ENOMEM;
     }
     memcpy(new_cmd, cmd, front_len);
-    sprintf(new_cmd + front_len, "%s", params[0]);
+    sprintf(new_cmd + front_len, "%s%s", params[0], tail);
     free(cpro->commands.list[0].cmd);
     cpro->commands.list[0].cmd = new_cmd;
 
@@ -1176,9 +1185,8 @@ static int start_process(ChildProcessInfo *process)
     pid = fork();
     if (pid == 0) { //child process
         const char *lfile;
-        char *argv[100];
+        char *argv[64];
         int argc;
-        char *cpos;
         int fd;
 
         lfile = process->logfile;
@@ -1192,17 +1200,26 @@ static int start_process(ChildProcessInfo *process)
         }
 
         argc = 0;
-        cpos = cmd;
-        argv[argc++] = cpos;
-        while ((cpos = strchr(cpos, ' ')) != NULL) {
-            *cpos++ = '\0';
-            while (*cpos == ' ') cpos++;
-            if (*cpos != '\0') {
-                argv[argc++] = cpos;
+        if (process->run_by_sh) {
+            printf("run by sh\n");
+            argv[argc++] = "/bin/sh";
+            argv[argc++] = "-c";
+            argv[argc++] = cmd;
+        } else {
+            char *cpos;
+
+            cpos = cmd;
+            argv[argc++] = cpos;
+            while ((cpos = strchr(cpos, ' ')) != NULL) {
+                *cpos++ = '\0';
+                while (*cpos == ' ') cpos++;
+                if (*cpos != '\0') {
+                    argv[argc++] = cpos;
+                }
             }
-        }
-        if (process->enable_access_log) {
-            argv[argc++] = process->acclog;
+            if (process->enable_access_log) {
+                argv[argc++] = process->acclog;
+            }
         }
         argv[argc++] = NULL;
         if (dup2(fd, 1) < 0 || dup2(fd, 2) < 0) {
@@ -1211,8 +1228,8 @@ static int start_process(ChildProcessInfo *process)
                     __LINE__, errno, strerror(errno));
             _exit(1);
         }
-        if (execv(argv[0], argv) < 0) {
-            logError("file: "__FILE__", line: %d, execv fail, "
+        if (execvp(argv[0], argv) < 0) {
+            logError("file: "__FILE__", line: %d, execvp fail, "
                     "errno: %d, error info: %s",
                     __LINE__, errno, strerror(errno));
             _exit(1);
