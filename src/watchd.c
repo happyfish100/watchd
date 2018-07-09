@@ -21,7 +21,8 @@
 #define DEFAULT_WAIT_SUBPROCESS 300
 #define DEFAULT_RESTART_INTERVAL 1000
 #define DEFAULT_CHECK_ALIVE_INTERVAL 0
-#define MAX_NAME_SIZE 64
+#define MAX_NAME_SIZE    64
+#define MAX_PARAM_COUNT  64
 
 #define MODE_FAILOVER 'f'
 #define MODE_ALL      'a'
@@ -59,12 +60,17 @@ typedef enum { hc_type_none=0, hc_type_kill,
 
 typedef int (*health_check_func)(int argc, char **argv);
 
+typedef struct command_params {
+    bool run_by_sh;
+    char *cmd;    //command line
+    int argc;
+    char **argv;
+} CommandParams;
+
 typedef struct command_entry {
-    char *cmd;  //exec command
+    CommandParams command;  //exec command
     struct health_check_entry {
-        char *cmd;    //check command
-        int argc;
-        char **argv;
+        CommandParams command;
         HealthCheckType type;
         health_check_func func;
     } health_check;
@@ -75,7 +81,6 @@ typedef struct child_process_info {
     bool running;
     char mode;  //run mode
     bool enable_access_log;
-    bool run_by_sh;
     int64_t last_start_time_ms;
     int last_check_alive_time;
     int restart_interval_ms;
@@ -124,6 +129,9 @@ typedef ChildProcessInfo* (*malloc_process_func)();
 
 static int expand_cmd(ChildProcessInfo *cpro, malloc_process_func malloc_func,
         ChildProcessInfo **processes, int *pnum, const int max_count);
+static int set_command_params(CommandParams *command, const bool enable_access_log,
+        char *acclog);
+static int process_set_command_params(ChildProcessInfo* cpro);
 
 static void usage(const char* program)
 {
@@ -404,10 +412,10 @@ static inline CommandEntry *get_current_command_entry(ChildProcessInfo* proc)
 
 static inline char *get_current_command(ChildProcessInfo* proc)
 {
-    return proc->commands.list[proc->commands.index].cmd;
+    return proc->commands.list[proc->commands.index].command.cmd;
 }
 
-static inline char *get_next_command(ChildProcessInfo* proc)
+static inline CommandParams *get_next_command(ChildProcessInfo* proc)
 {
     if (proc->commands.count > 1 && proc->run_count > 0) {
         proc->commands.index++;
@@ -417,7 +425,7 @@ static inline char *get_next_command(ChildProcessInfo* proc)
     }
 
     proc->run_count++;
-    return proc->commands.list[proc->commands.index].cmd;
+    return &proc->commands.list[proc->commands.index].command;
 }
 
 static int process_info_cmp_pid(const void *p1, const void *p2)
@@ -430,8 +438,9 @@ static int schedule_task_func(void *args)
     ChildProcessInfo *process;
     process = (ChildProcessInfo *)args;
 
-    logInfo("file: "__FILE__", line: %d, run cron process: %s %s",
-            __LINE__, get_current_command(process),
+    logInfo("file: "__FILE__", line: %d, run cron process%s: %s %s",
+            __LINE__, get_current_command_entry(process)->command.run_by_sh ?
+            "(run by sh -c)" : "", get_current_command(process),
             process->enable_access_log ? process->acclog : "");
     if (start_process(process) == 0) {
         if (cron_proc_array.count > 1) {
@@ -549,6 +558,13 @@ static int add_shedule_entries()
                     pCronEntry->time_base, pCronEntry->interval,
                     schedule_task_func, process);
             shedule_array.count++;
+        }
+    }
+
+    logInfo("cron_proc_array.count: %d", cron_proc_array.count);
+    for (i = 0; i < cron_proc_array.count; i++) {
+        if ((result=process_set_command_params(cron_proc_array.processes[i])) != 0) {
+            return result;
         }
     }
 
@@ -697,8 +713,8 @@ static int ini_section_load(const int index, const HashData *data, void *args)
             if (check_alloc_command_array(&cpro->commands, 1) != 0) {
                 return ENOMEM;
             }
-            cpro->run_by_sh = is_run_by_sh(cmd);
-            cpro->commands.list[0].cmd = strdup(cmd);
+            cpro->commands.list[0].command.run_by_sh = is_run_by_sh(cmd);
+            cpro->commands.list[0].command.cmd = strdup(cmd);
             cpro->commands.count = 1;
             cpro->logfile = strdup(logfiles_all[logfiles_count]);
             cpro->acclog = strdup(acclogs_all[logfiles_count]);
@@ -723,12 +739,12 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 } else {
                     cpro->mode = MODE_ALL;
                 }
-                cpro->run_by_sh = is_run_by_sh(cmd);
-                cpro->commands.list[0].cmd = strdup(cmd);
+                cpro->commands.list[0].command.run_by_sh = is_run_by_sh(cmd);
+                cpro->commands.list[0].command.cmd = strdup(cmd);
 
                 if (new_check_alive_interval > 0) {
                     if (check_alive_command != NULL) {
-                        cpro->commands.list[0].health_check.cmd = strdup(check_alive_command);
+                        cpro->commands.list[0].health_check.command.cmd = strdup(check_alive_command);
                     }
                 }
 
@@ -861,7 +877,7 @@ static int expand_cmd(ChildProcessInfo *cpro,
     int word_len;
     int front_len;
 
-    cmd = cpro->commands.list[0].cmd;
+    cmd = cpro->commands.list[0].command.cmd;
     cmd_len = strlen(cmd);
     pdollar = (char*)strchr(cmd, '$');
     if (pdollar == NULL) { //no need to expand
@@ -919,15 +935,15 @@ static int expand_cmd(ChildProcessInfo *cpro,
             if (check_alloc_command_array(&lpro->commands, 1) != 0) {
                 return ENOMEM;
             }
-            lpro->commands.list[0].cmd = malloc(cmd_len + strlen(params[i]) + 1);
-            if (lpro->commands.list[0].cmd == NULL) {
+            lpro->commands.list[0].command.cmd = malloc(cmd_len + strlen(params[i]) + 1);
+            if (lpro->commands.list[0].command.cmd == NULL) {
                 logError("file: "__FILE__", line: %d, malloc %d bytes fail",
                         __LINE__, (int)(cmd_len + strlen(params[i])) + 1);
                 return ENOMEM;
             }
             lpro->commands.count = 1;
-            memcpy(lpro->commands.list[0].cmd, cmd, front_len);
-            sprintf(lpro->commands.list[0].cmd + front_len, "%s%s", params[i], tail);
+            memcpy(lpro->commands.list[0].command.cmd, cmd, front_len);
+            sprintf(lpro->commands.list[0].command.cmd + front_len, "%s%s", params[i], tail);
 
             if (processes != NULL) {
                 if (i < max_count) {
@@ -949,15 +965,16 @@ static int expand_cmd(ChildProcessInfo *cpro,
             return ENOMEM;
         }
         for (i=1; i<count; i++) {
-            cpro->commands.list[i].cmd = malloc(cmd_len + strlen(params[i]) + 1);
-            if (cpro->commands.list[i].cmd == NULL) {
+            cpro->commands.list[i].command.run_by_sh = cpro->commands.list[0].command.run_by_sh;
+            cpro->commands.list[i].command.cmd = malloc(cmd_len + strlen(params[i]) + 1);
+            if (cpro->commands.list[i].command.cmd == NULL) {
                 logError("file: "__FILE__", line: %d, malloc %d bytes fail",
                         __LINE__, (int)(cmd_len + strlen(params[i])) + 1);
                 return ENOMEM;
             }
-            memcpy(cpro->commands.list[i].cmd, cmd, front_len);
-            sprintf(cpro->commands.list[i].cmd + front_len, "%s%s", params[i], tail);
-            cpro->commands.list[i].health_check.cmd = cpro->commands.list[0].health_check.cmd;
+            memcpy(cpro->commands.list[i].command.cmd, cmd, front_len);
+            sprintf(cpro->commands.list[i].command.cmd + front_len, "%s%s", params[i], tail);
+            cpro->commands.list[i].health_check.command.cmd = cpro->commands.list[0].health_check.command.cmd;
         }
         cpro->commands.count = count;
         if (processes != NULL) {
@@ -974,9 +991,8 @@ static int expand_cmd(ChildProcessInfo *cpro,
     }
     memcpy(new_cmd, cmd, front_len);
     sprintf(new_cmd + front_len, "%s%s", params[0], tail);
-    free(cpro->commands.list[0].cmd);
-    cpro->commands.list[0].cmd = new_cmd;
-
+    free(cpro->commands.list[0].command.cmd);
+    cpro->commands.list[0].command.cmd = new_cmd;
     return 0;
 }
 
@@ -985,16 +1001,213 @@ static int expand_child_cmd(ChildProcessInfo *cpro)
     return expand_cmd(cpro, malloc_child_process_entry, NULL, NULL, 0);
 }
 
+static char *get_command_param(char **str, char *end)
+{
+    char *p;
+    char *start;
+    char quote;
+
+    p = *str;
+    if (!(*p == '\'' || *p == '"')) {
+        return p;
+    }
+
+    quote = *p;
+    start = ++p;
+    while (p < end && *p != quote) {
+        p++;
+    }
+    if (p == end) {
+        logError("file: "__FILE__", line: %d, "
+                "expect quote char: %c!",
+                __LINE__, quote);
+        return NULL;
+    }
+    if (p + 1 < end && *(p + 1) != ' ') {
+        logError("file: "__FILE__", line: %d, "
+                "expect space char, but char %c occurs!",
+                __LINE__, *(p + 1));
+        return NULL;
+    }
+
+    *p = '\0';
+    *str = p + 1;
+    return start;
+}
+
+static int split_command_params(char *cmd, char **argv, int *argc,
+        const int max_count)
+{
+    int count;
+    char *p;
+    char *end;
+
+    count = 0;
+    p = cmd;
+    end = cmd + strlen(cmd);
+    argv[count] = get_command_param(&p, end);
+    if (argv[count] == NULL) {
+        return EINVAL;
+    }
+    count++;
+
+    while ((p = strchr(p, ' ')) != NULL) {
+        *p++ = '\0';
+        while (*p == ' ') p++;
+        if (*p != '\0') {
+            if (count < max_count) {
+                argv[count] = get_command_param(&p, end);
+                if (argv[count] == NULL) {
+                    return EINVAL;
+                }
+                count++;
+            } else {
+                logError("file: "__FILE__", line: %d, "
+                        "too many parameters exceeds %d!",
+                        __LINE__, max_count);
+                return ENAMETOOLONG;
+            }
+        }
+    }
+
+    *argc = count;
+    return 0;
+}
+
+
+static int set_command_params(CommandParams *command, const bool enable_access_log,
+        char *acclog)
+{
+    char *argv[MAX_PARAM_COUNT + 2];
+    char *cmd;
+    int result;
+    int argc;
+    int bytes;
+
+    argc = 0;
+    if (command->run_by_sh) {
+        argv[argc++] = strdup("/bin/sh");
+        argv[argc++] = "-c";
+        argv[argc++] = command->cmd;
+    } else {
+        cmd = strdup(command->cmd);
+        result = split_command_params(cmd, argv, &argc, MAX_PARAM_COUNT);
+        if (result != 0) {
+            free(cmd);
+            return result;
+        }
+
+        if (enable_access_log) {
+            argv[argc++] = acclog;
+        }
+    }
+    argv[argc++] = NULL;
+
+    bytes = sizeof(char *) * argc;
+    command->argv = (char **)malloc(bytes);
+    if (command->argv == NULL) {
+        logError("file: "__FILE__", line: %d, "
+                "malloc %d bytes fail", __LINE__, bytes);
+        return ENOMEM;
+    }
+
+    command->argc = argc;
+    memcpy(command->argv, argv, bytes);
+    return 0;
+}
+
+static int replace_check_alive_command(CommandEntry *entry)
+{
+    char *src;
+    char *dest;
+    char *start;
+    char *p;
+    char *end;
+    char *new_cmd;
+    int bytes;
+    int num_len;
+    int param_len;
+    int n;
+    char num[4];
+
+    bytes = strlen(entry->command.cmd) + strlen(entry->health_check.command.cmd);
+    new_cmd = (char *)malloc(bytes);
+    if (new_cmd == NULL) {
+        logError("file: "__FILE__", line: %d, "
+                "malloc %d bytes fail", __LINE__, bytes);
+        return ENOMEM;
+    }
+
+    dest = new_cmd;
+    src = entry->health_check.command.cmd;
+    end = entry->health_check.command.cmd + strlen(entry->health_check.command.cmd);
+    while (src < end) {
+        if (*src != '$') {
+            *dest++ = *src++;
+            continue;
+        }
+
+        start = p = src + 1;
+        while (p < end && (*p >= '0' && *p <= '9')) {
+            p++;
+        }
+
+        num_len = p - start;
+        if (num_len == 0) {
+            *dest++ = *src++;
+            continue;
+        }
+
+        if (num_len >= (int)sizeof(num)) {
+            logError("file: "__FILE__", line: %d, "
+                    "group number %.*s is too large",
+                    __LINE__, num_len, start);
+            return ENAMETOOLONG;
+        }
+        memcpy(num, start, num_len);
+        *(num + num_len) = '\0';
+        n = atoi(num);
+        if (n < 1 || n >= entry->command.argc) {
+            logError("file: "__FILE__", line: %d, "
+                    "group number %d is invalid",
+                    __LINE__, n);
+            return ENAMETOOLONG;
+        }
+
+        param_len = strlen(entry->command.argv[n]);
+        memcpy(dest, entry->command.argv[n], param_len);
+        dest += param_len;
+        src = p;
+    }
+
+    *dest = '\0';
+    free(entry->health_check.command.cmd);
+    entry->health_check.command.cmd = new_cmd;
+    return 0;
+}
+
 static int parse_check_alive_command(ChildProcessInfo* cpro)
 {
     int i;
+    int result;
     struct health_check_entry *health_check;
 
     for (i=0; i<cpro->commands.count; i++) {
         health_check = &cpro->commands.list[i].health_check;
+        if (strchr(health_check->command.cmd, '$') != NULL) {
+            result = replace_check_alive_command(cpro->commands.list + i);
+            if (result != 0) {
+                return result;
+            }
+        }
 
-        logInfo("cmd: %s", cpro->commands.list[i].cmd);
-        logInfo("check cmd: %s", health_check->cmd);
+        result = set_command_params(&health_check->command, false, NULL);
+        if (result != 0) {
+            return result;
+        }
+
+        logInfo("cmd: %s", cpro->commands.list[i].command.cmd);
+        logInfo("check cmd: %s", health_check->command.cmd);
     }
 
     return 0;
@@ -1011,6 +1224,22 @@ static int parse_check_alive_commands()
             if (result != 0) {
                 return result;
             }
+        }
+    }
+
+    return 0;
+}
+
+static int process_set_command_params(ChildProcessInfo* cpro)
+{
+    int i;
+    int result;
+
+    for (i=0; i<cpro->commands.count; i++) {
+        result = set_command_params(&cpro->commands.list[i].command,
+                cpro->enable_access_log, cpro->acclog);
+        if (result != 0) {
+            return result;
         }
     }
 
@@ -1100,11 +1329,14 @@ static int load_from_conf_file(const char* filename)
 
     for (i = child_proc_array.count-1; i >= 0; i--) {
         if ((result=expand_child_cmd(child_proc_array.processes[i])) != 0) {
-            break;
+            return result;
         }
     }
-    if (result != 0) {
-        return result;
+
+    for (i = 0; i < child_proc_array.count; i++) {
+        if ((result=process_set_command_params(child_proc_array.processes[i])) != 0) {
+            return result;
+        }
     }
 
     return parse_check_alive_commands();
@@ -1179,14 +1411,12 @@ static int update_process(int pid, const int status)
 static int start_process(ChildProcessInfo *process)
 {
     pid_t pid;
-    char cmd[MAX_PATH_SIZE];
+    CommandParams *command;
 
-    snprintf(cmd, sizeof cmd, "%s", get_next_command(process));
+    command = get_next_command(process);
     pid = fork();
     if (pid == 0) { //child process
         const char *lfile;
-        char *argv[64];
-        int argc;
         int fd;
 
         lfile = process->logfile;
@@ -1199,36 +1429,13 @@ static int start_process(ChildProcessInfo *process)
             _exit(1);
         }
 
-        argc = 0;
-        if (process->run_by_sh) {
-            printf("run by sh\n");
-            argv[argc++] = "/bin/sh";
-            argv[argc++] = "-c";
-            argv[argc++] = cmd;
-        } else {
-            char *cpos;
-
-            cpos = cmd;
-            argv[argc++] = cpos;
-            while ((cpos = strchr(cpos, ' ')) != NULL) {
-                *cpos++ = '\0';
-                while (*cpos == ' ') cpos++;
-                if (*cpos != '\0') {
-                    argv[argc++] = cpos;
-                }
-            }
-            if (process->enable_access_log) {
-                argv[argc++] = process->acclog;
-            }
-        }
-        argv[argc++] = NULL;
         if (dup2(fd, 1) < 0 || dup2(fd, 2) < 0) {
             logError("file: "__FILE__", line: %d, dup2 fail, "
                     "errno: %d, error info: %s",
                     __LINE__, errno, strerror(errno));
             _exit(1);
         }
-        if (execvp(argv[0], argv) < 0) {
+        if (execvp(command->argv[0], command->argv) < 0) {
             logError("file: "__FILE__", line: %d, execvp fail, "
                     "errno: %d, error info: %s",
                     __LINE__, errno, strerror(errno));
@@ -1266,9 +1473,11 @@ static int start_all_processes()
             child_proc_array.processes[i]->running = true;
             child_proc_array.processes[i]->last_start_time_ms = get_current_time_ms();
             child_running++;
-            logInfo("file: "__FILE__", line: %d, process %d started. "
-                    "running %d processes. %s %s", __LINE__,
-                    child_proc_array.processes[i]->pid,
+            logInfo("file: "__FILE__", line: %d, process %d started%s."
+                    " running %d processes. %s %s",
+                    __LINE__, child_proc_array.processes[i]->pid,
+                    get_current_command_entry(child_proc_array.processes[i])->
+                    command.run_by_sh ? "(run by sh -c)" : "",
                     child_running, get_current_command(child_proc_array.processes[i]),
                     child_proc_array.processes[i]->enable_access_log ?
                     child_proc_array.processes[i]->acclog : "");
