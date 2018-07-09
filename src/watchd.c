@@ -199,8 +199,14 @@ int main(int argc, char* argv[])
 
     log_set_use_file_write_lock(true);
     if ((result=log_set_filename(logfile)) != 0) {
-        logCrit("file: "__FILE__", line: %d, "
-            "call set log_set_filename fail, exit!", __LINE__);
+        if (result == EAGAIN || result == EACCES) {
+            logCrit("file: "__FILE__", line: %d, "
+                    "the process already running, "
+                    "please kill the old process first!", __LINE__);
+        } else {
+            logCrit("file: "__FILE__", line: %d, "
+                    "call set log_set_filename fail, exit!", __LINE__);
+        }
         return result;
     }
     close(0);
@@ -1164,17 +1170,17 @@ static int update_process(int pid, const int status)
 static int start_process(ChildProcessInfo *process)
 {
     pid_t pid;
+    char cmd[MAX_PATH_SIZE];
 
+    snprintf(cmd, sizeof cmd, "%s", get_next_command(process));
     pid = fork();
     if (pid == 0) { //child process
         const char *lfile;
-        char cmd[MAX_PATH_SIZE];
         char *argv[100];
         int argc;
         char *cpos;
         int fd;
 
-        snprintf(cmd, sizeof cmd, "%s", get_next_command(process));
         lfile = process->logfile;
         fd = open(lfile, O_APPEND | O_CREAT | O_WRONLY, 0644);
         umask(022);
