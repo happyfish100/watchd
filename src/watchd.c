@@ -17,7 +17,7 @@
 #include "fastcommon/process_ctrl.h"
 #include "fastcommon/ini_file_reader.h"
 
-#define MAX_CHILD_PROCESS 1024
+#define MAX_CRON_PROCESS_PER_ENTRY 64
 #define DEFAULT_WAIT_SUBPROCESS 300
 #define DEFAULT_RESTART_INTERVAL 1000
 #define DEFAULT_CHECK_ALIVE_INTERVAL 0
@@ -121,7 +121,7 @@ static CronEntry *cron_entries = NULL;
 typedef ChildProcessInfo* (*malloc_process_func)();
 
 static int expand_cmd(ChildProcessInfo *cpro, malloc_process_func malloc_func,
-        ChildProcessInfo **processes, int *pnum);
+        ChildProcessInfo **processes, int *pnum, const int max_count);
 
 static void usage(const char* program)
 {
@@ -503,7 +503,7 @@ static int check_alloc_schedule_entries(ScheduleArray *pSheduleArray,
 
 static int add_shedule_entries()
 {
-    ChildProcessInfo *cron_processes[MAX_CHILD_PROCESS];
+    ChildProcessInfo *cron_processes[MAX_CRON_PROCESS_PER_ENTRY];
     ChildProcessInfo *process;
     CronEntry *pCronEntry;
     ScheduleEntry *pScheduleEntry;
@@ -521,7 +521,8 @@ static int add_shedule_entries()
         pCronEntry = cron_entries + i;
         count = 0;
         result = expand_cmd(cron_proc_array.processes[i],
-                malloc_cron_process_entry, cron_processes, &count);
+                malloc_cron_process_entry, cron_processes, &count,
+                MAX_CRON_PROCESS_PER_ENTRY);
         if (result != 0) {
             return result;
         }
@@ -720,12 +721,6 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 cpro->restart_interval_ms = new_restart_interval_ms;
                 cpro->check_alive_interval = new_check_alive_interval;
                 cpro->enable_access_log = enableAccessLog;
-                if (child_proc_array.count >= MAX_CHILD_PROCESS) {
-                    logError("file: "__FILE__", line: %d, "
-                            "child count exceed limit %d",
-                            __LINE__, MAX_CHILD_PROCESS);
-                    return EINVAL;
-                }
             }
             logfiles_count++;
         } else {
@@ -828,7 +823,8 @@ static int get_params(char *str, char *out_buff, const int buff_size,
 }
 
 static int expand_cmd(ChildProcessInfo *cpro,
-        malloc_process_func malloc_func, ChildProcessInfo **processes, int *pnum)
+        malloc_process_func malloc_func, ChildProcessInfo **processes,
+        int *pnum, const int max_count)
 {
 #define MAX_PARAMS_COUNT 256
 
@@ -919,7 +915,13 @@ static int expand_cmd(ChildProcessInfo *cpro,
             sprintf(lpro->commands.list[0].cmd + front_len, "%s", params[i]);
 
             if (processes != NULL) {
-                processes[i] = lpro;
+                if (i < max_count) {
+                    processes[i] = lpro;
+                } else {
+                    logWarning("file: "__FILE__", line: %d, "
+                            "exceeds max count: %d",
+                            __LINE__, max_count);
+                }
             }
         }
 
@@ -965,7 +967,7 @@ static int expand_cmd(ChildProcessInfo *cpro,
 
 static int expand_child_cmd(ChildProcessInfo *cpro)
 {
-    return expand_cmd(cpro, malloc_child_process_entry, NULL, NULL);
+    return expand_cmd(cpro, malloc_child_process_entry, NULL, NULL, 0);
 }
 
 static int parse_check_alive_command(ChildProcessInfo* cpro)
