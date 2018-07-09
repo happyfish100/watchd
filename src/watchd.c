@@ -744,7 +744,8 @@ static int ini_section_load(const int index, const HashData *data, void *args)
 
                 if (new_check_alive_interval > 0) {
                     if (check_alive_command != NULL) {
-                        cpro->commands.list[0].health_check.command.cmd = strdup(check_alive_command);
+                        cpro->commands.list[0].health_check.command.cmd =
+                            strdup(check_alive_command);
                     }
                 }
 
@@ -944,6 +945,8 @@ static int expand_cmd(ChildProcessInfo *cpro,
             lpro->commands.count = 1;
             memcpy(lpro->commands.list[0].command.cmd, cmd, front_len);
             sprintf(lpro->commands.list[0].command.cmd + front_len, "%s%s", params[i], tail);
+            lpro->commands.list[0].health_check.command.cmd = strdup(
+                    cpro->commands.list[0].health_check.command.cmd);
 
             if (processes != NULL) {
                 if (i < max_count) {
@@ -974,7 +977,8 @@ static int expand_cmd(ChildProcessInfo *cpro,
             }
             memcpy(cpro->commands.list[i].command.cmd, cmd, front_len);
             sprintf(cpro->commands.list[i].command.cmd + front_len, "%s%s", params[i], tail);
-            cpro->commands.list[i].health_check.command.cmd = cpro->commands.list[0].health_check.command.cmd;
+            cpro->commands.list[i].health_check.command.cmd = strdup(
+                    cpro->commands.list[0].health_check.command.cmd);
         }
         cpro->commands.count = count;
         if (processes != NULL) {
@@ -1124,10 +1128,15 @@ static int replace_check_alive_command(CommandEntry *entry)
     char *p;
     char *end;
     char *new_cmd;
+    int result;
     int bytes;
     int num_len;
     int param_len;
     int n;
+    int argc;
+    char *buff;
+    char *params[MAX_PARAM_COUNT];
+    char **argv;
     char num[4];
 
     bytes = strlen(entry->command.cmd) + strlen(entry->health_check.command.cmd);
@@ -1136,6 +1145,25 @@ static int replace_check_alive_command(CommandEntry *entry)
         logError("file: "__FILE__", line: %d, "
                 "malloc %d bytes fail", __LINE__, bytes);
         return ENOMEM;
+    }
+
+    if (entry->command.run_by_sh) {
+        buff = strdup(entry->command.cmd);
+        if (buff == NULL) {
+            logError("file: "__FILE__", line: %d, "
+                    "malloc %d bytes fail", __LINE__,
+                    (int)strlen(entry->command.cmd));
+            return ENOMEM;
+        }
+        result = split_command_params(buff, params, &argc, MAX_PARAM_COUNT);
+        if (result != 0) {
+            return result;
+        }
+        argv = params;
+    } else {
+        buff = NULL;
+        argc = entry->command.argc;
+        argv = entry->command.argv;
     }
 
     dest = new_cmd;
@@ -1167,19 +1195,22 @@ static int replace_check_alive_command(CommandEntry *entry)
         memcpy(num, start, num_len);
         *(num + num_len) = '\0';
         n = atoi(num);
-        if (n < 1 || n >= entry->command.argc) {
+        if (n < 1 || n >= argc) {
             logError("file: "__FILE__", line: %d, "
                     "group number %d is invalid",
                     __LINE__, n);
             return ENAMETOOLONG;
         }
 
-        param_len = strlen(entry->command.argv[n]);
-        memcpy(dest, entry->command.argv[n], param_len);
+        param_len = strlen(argv[n]);
+        memcpy(dest, argv[n], param_len);
         dest += param_len;
         src = p;
     }
 
+    if (buff != NULL) {
+        free(buff);
+    }
     *dest = '\0';
     free(entry->health_check.command.cmd);
     entry->health_check.command.cmd = new_cmd;
@@ -1194,6 +1225,11 @@ static int parse_check_alive_command(ChildProcessInfo* cpro)
 
     for (i=0; i<cpro->commands.count; i++) {
         health_check = &cpro->commands.list[i].health_check;
+        if (health_check->command.cmd == NULL) {
+            health_check->type = hc_type_kill;
+            continue;
+        }
+
         if (strchr(health_check->command.cmd, '$') != NULL) {
             result = replace_check_alive_command(cpro->commands.list + i);
             if (result != 0) {
@@ -1206,8 +1242,8 @@ static int parse_check_alive_command(ChildProcessInfo* cpro)
             return result;
         }
 
-        logInfo("cmd: %s", cpro->commands.list[i].command.cmd);
-        logInfo("check cmd: %s", health_check->command.cmd);
+        logInfo("cmd2: %s", cpro->commands.list[i].command.cmd);
+        logInfo("check cmd2: %s", health_check->command.cmd);
     }
 
     return 0;
@@ -1494,7 +1530,8 @@ static int start_all_processes()
 static int stop_all_processes()
 {
     int i;
-    long btime;
+    int64_t btime;
+
     btime = get_current_time_ms();
     for (i = 0; i < child_proc_array.count; i++) {
         ChildProcessInfo* pro = child_proc_array.processes[i];
@@ -1532,7 +1569,7 @@ static int stop_all_processes()
         }
     }
     logInfo("file: "__FILE__", line: %d, all subprocesses stopped. "
-            "used %ld ms, child_running %d", __LINE__,
+            "used %"PRId64" ms, child_running %d", __LINE__,
             get_current_time_ms() - btime, child_running);
     return 0;
 }
