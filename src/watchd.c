@@ -11,18 +11,22 @@
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <stdarg.h>
+#include <dlfcn.h>
 #include "fastcommon/logger.h"
 #include "fastcommon/shared_func.h"
 #include "fastcommon/sched_thread.h"
 #include "fastcommon/process_ctrl.h"
 #include "fastcommon/ini_file_reader.h"
+#include "fastcommon/pthread_func.h"
 
 #define MAX_CRON_PROCESS_PER_ENTRY 64
 #define DEFAULT_WAIT_SUBPROCESS 300
 #define DEFAULT_RESTART_INTERVAL 1000
 #define DEFAULT_CHECK_ALIVE_INTERVAL 0
+#define DEFAULT_CHECK_ALIVE_RETRY_THRESHOLD 1
 #define MAX_NAME_SIZE    64
 #define MAX_PARAM_COUNT  64
+#define CHECK_ALIVE_THREAD_STACK_SIZE  (64 * 1024)
 
 #define MODE_FAILOVER 'f'
 #define MODE_ALL      'a'
@@ -38,11 +42,14 @@ static int subprocess_number = 1;
 static int wait_subprocess_ms = DEFAULT_WAIT_SUBPROCESS;
 static int restart_interval_ms = DEFAULT_RESTART_INTERVAL;
 static int check_alive_interval = DEFAULT_CHECK_ALIVE_INTERVAL;
+static int check_alive_retry_threshold = DEFAULT_CHECK_ALIVE_RETRY_THRESHOLD;
 static time_t last_check_alive_time;
 static bool enable_access_log = false;
-static pthread_t schedule_tid;
+static bool takeover_stdout = true;
+static bool takeover_stderr = true;
 static bool continue_flag = true;
 static volatile bool restart_subprocess = false;
+static pthread_t schedule_tid;
 static int log_file_keep_days = 0;
 
 static char pidfile[MAX_PATH_SIZE];
@@ -73,6 +80,7 @@ typedef struct command_entry {
         CommandParams command;
         HealthCheckType type;
         health_check_func func;
+        int fail_count;
     } health_check;
 } CommandEntry;
 
@@ -81,10 +89,13 @@ typedef struct child_process_info {
     bool running;
     char mode;  //run mode
     bool enable_access_log;
+    bool takeover_stdout;
+    bool takeover_stderr;
     int64_t last_start_time_ms;
     int last_check_alive_time;
     int restart_interval_ms;
     int check_alive_interval;
+    int check_alive_retry_threshold;
     uint32_t run_count;
     char *logfile;
     char *acclog;
@@ -140,12 +151,16 @@ static void usage(const char* program)
 
 static int update_process(int pid, const int status);
 static int check_all_processes();
+static int run_process(ChildProcessInfo *process,
+        CommandParams *command, pid_t *pid);
 static int start_all_processes();
 static int stop_all_processes();
 static int rotate_logs();
 static void check_subproccess_alive();
 static int start_process(ChildProcessInfo *process);
 static int add_shedule_entries();
+static void *check_alive_entrance(void *args);
+static int start_health_check_threads();
 
 int main(int argc, char* argv[])
 {
@@ -241,7 +256,10 @@ int main(int argc, char* argv[])
             "running processes count: %d",
             __LINE__, program, child_running);
 
-    sched_print_all_entries();
+    //sched_print_all_entries();
+    if ((result=start_health_check_threads()) != 0) {
+        continue_flag = false;
+    }
 
     while (continue_flag) {
         if (restart_subprocess) {
@@ -314,6 +332,38 @@ static int setup_sig_handlers()
     }
 
     return 0;
+}
+
+static inline CommandEntry *get_current_command_entry(ChildProcessInfo* proc)
+{
+    return proc->commands.list + proc->commands.index;
+}
+
+static inline char *get_current_command(ChildProcessInfo* proc)
+{
+    return proc->commands.list[proc->commands.index].command.cmd;
+}
+
+static inline CommandParams *get_next_command(ChildProcessInfo* proc)
+{
+    if (proc->commands.count > 1 && proc->run_count > 0) {
+        proc->commands.index++;
+        if (proc->commands.index >= proc->commands.count) {
+            proc->commands.index = 0;
+        }
+    }
+
+    proc->run_count++;
+    return &proc->commands.list[proc->commands.index].command;
+}
+
+static inline char *do_strdup(const char *str)
+{
+    if (str == NULL) {
+        return NULL;
+    } else {
+        return strdup(str);
+    }
 }
 
 static int parse_args(int argc, char* argv[])
@@ -405,29 +455,6 @@ static int check_alloc_command_array(struct command_array *commands,
      return 0;
 }
 
-static inline CommandEntry *get_current_command_entry(ChildProcessInfo* proc)
-{
-    return proc->commands.list + proc->commands.index;
-}
-
-static inline char *get_current_command(ChildProcessInfo* proc)
-{
-    return proc->commands.list[proc->commands.index].command.cmd;
-}
-
-static inline CommandParams *get_next_command(ChildProcessInfo* proc)
-{
-    if (proc->commands.count > 1 && proc->run_count > 0) {
-        proc->commands.index++;
-        if (proc->commands.index >= proc->commands.count) {
-            proc->commands.index = 0;
-        }
-    }
-
-    proc->run_count++;
-    return &proc->commands.list[proc->commands.index].command;
-}
-
 static int process_info_cmp_pid(const void *p1, const void *p2)
 {
     return (*((ChildProcessInfo **)p1))->pid - (*((ChildProcessInfo **)p2))->pid;
@@ -449,6 +476,56 @@ static int schedule_task_func(void *args)
         }
     }
     return 0;
+}
+
+static int start_health_check_threads()
+{
+    ChildProcessInfo **child;
+    ChildProcessInfo **end;
+    CommandEntry *command_entry;
+    pthread_attr_t thread_attr;
+    pthread_t tid;
+    int result;
+    int count;
+
+    result = init_pthread_attr(&thread_attr, CHECK_ALIVE_THREAD_STACK_SIZE);
+    if (result != 0) {
+        return result;
+    }
+
+    count = 0;
+    end = child_proc_array.processes + child_proc_array.count;
+    for (child=child_proc_array.processes; child<end; child++) {
+        if ((*child)->check_alive_interval <= 0) {
+            continue;
+        }
+
+        command_entry = get_current_command_entry(*child);
+        if (!(command_entry->health_check.type == hc_type_exec || 
+                command_entry->health_check.type == hc_type_library))
+        {
+            continue;
+        }
+
+        if ((result=pthread_create(&tid, &thread_attr,
+                        check_alive_entrance, *child)) != 0)
+        {
+            logError("file: "__FILE__", line: %d, "
+                    "create thread failed, errno: %d, error info: %s",
+                    __LINE__, result, strerror(result));
+            break;
+        }
+        count++;
+    }
+
+    if (result == 0 && count > 0) {
+        logInfo("file: "__FILE__", line: %d, "
+                "health check threads count: %d",
+                __LINE__, count);
+    }
+
+    pthread_attr_destroy(&thread_attr);
+    return result;
 }
 
 static ChildProcessInfo *malloc_process_entry(ChildProcessArray *processArray)
@@ -561,14 +638,16 @@ static int add_shedule_entries()
         }
     }
 
-    logInfo("cron_proc_array.count: %d", cron_proc_array.count);
-    for (i = 0; i < cron_proc_array.count; i++) {
-        if ((result=process_set_command_params(cron_proc_array.processes[i])) != 0) {
-            return result;
+    if (cron_proc_array.count > 0) {
+        logInfo("cron processes count: %d", cron_proc_array.count);
+        for (i = 0; i < cron_proc_array.count; i++) {
+            if ((result=process_set_command_params(cron_proc_array.processes[i])) != 0) {
+                return result;
+            }
         }
     }
 
-    if ((result=sched_add_entries(&shedule_array)) != 0) {
+    if (shedule_array.count > 0 && (result=sched_add_entries(&shedule_array)) != 0) {
         return result;
     }
 
@@ -649,6 +728,9 @@ static int ini_section_load(const int index, const HashData *data, void *args)
         int cnum = subprocess_number;
         int new_restart_interval_ms = restart_interval_ms;
         int new_check_alive_interval = check_alive_interval;
+        int new_check_alive_retry_threshold = check_alive_retry_threshold;
+        int new_takeover_stdout = takeover_stdout;
+        int new_takeover_stderr = takeover_stderr;
         int repeat_interval;
         bool enableAccessLog = enable_access_log;
 
@@ -668,6 +750,15 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 new_restart_interval_ms = atoi(pItem->value);
             } else if (strcmp(pItem->name, "check_alive_interval") == 0) {
                 new_check_alive_interval = atoi(pItem->value);
+            } else if (strcmp(pItem->name, "check_alive_retry_threshold") == 0) {
+                new_check_alive_retry_threshold = atoi(pItem->value);
+                if (new_check_alive_retry_threshold <= 0) {
+                    new_check_alive_retry_threshold = DEFAULT_CHECK_ALIVE_RETRY_THRESHOLD;
+                }
+            } else if (strcmp(pItem->name, "takeover_stdout") == 0) {
+                new_takeover_stdout = FAST_INI_STRING_IS_TRUE(pItem->value);
+            } else if (strcmp(pItem->name, "takeover_stderr") == 0) {
+                new_takeover_stderr = FAST_INI_STRING_IS_TRUE(pItem->value);
             } else if (strcmp(pItem->name, "check_alive_command") == 0) {
                 check_alive_command = pItem->value;
             } else if (strcmp(pItem->name, "type") == 0) {
@@ -720,6 +811,8 @@ static int ini_section_load(const int index, const HashData *data, void *args)
             cpro->acclog = strdup(acclogs_all[logfiles_count]);
             cpro->mode = MODE_ALL;
             cpro->enable_access_log = enableAccessLog;
+            cpro->takeover_stdout = new_takeover_stdout;
+            cpro->takeover_stderr = new_takeover_stderr;
             return add_cron_entry(cpro, time_base, repeat_interval);
         }
 
@@ -754,7 +847,10 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 cpro->acclog = acclogs_all[logfiles_count];
                 cpro->restart_interval_ms = new_restart_interval_ms;
                 cpro->check_alive_interval = new_check_alive_interval;
+                cpro->check_alive_retry_threshold = new_check_alive_retry_threshold;
                 cpro->enable_access_log = enableAccessLog;
+                cpro->takeover_stdout = new_takeover_stdout;
+                cpro->takeover_stderr = new_takeover_stderr;
             }
             logfiles_count++;
         } else {
@@ -945,7 +1041,7 @@ static int expand_cmd(ChildProcessInfo *cpro,
             lpro->commands.count = 1;
             memcpy(lpro->commands.list[0].command.cmd, cmd, front_len);
             sprintf(lpro->commands.list[0].command.cmd + front_len, "%s%s", params[i], tail);
-            lpro->commands.list[0].health_check.command.cmd = strdup(
+            lpro->commands.list[0].health_check.command.cmd = do_strdup(
                     cpro->commands.list[0].health_check.command.cmd);
 
             if (processes != NULL) {
@@ -977,7 +1073,7 @@ static int expand_cmd(ChildProcessInfo *cpro,
             }
             memcpy(cpro->commands.list[i].command.cmd, cmd, front_len);
             sprintf(cpro->commands.list[i].command.cmd + front_len, "%s%s", params[i], tail);
-            cpro->commands.list[i].health_check.command.cmd = strdup(
+            cpro->commands.list[i].health_check.command.cmd = do_strdup(
                     cpro->commands.list[0].health_check.command.cmd);
         }
         cpro->commands.count = count;
@@ -1242,8 +1338,31 @@ static int parse_check_alive_command(ChildProcessInfo* cpro)
             return result;
         }
 
-        logInfo("cmd2: %s", cpro->commands.list[i].command.cmd);
-        logInfo("check cmd2: %s", health_check->command.cmd);
+        if (ends_with(health_check->command.argv[0], ".so")) {
+            void *handle;
+            health_check->type = hc_type_library;
+            handle = dlopen(health_check->command.argv[0], RTLD_LAZY);
+            if (handle == NULL) {
+                logError("file: "__FILE__", line: %d, load library %s fail, "
+                        "error info: %s", __LINE__, health_check->command.argv[0],
+                        dlerror());
+                return EFAULT;
+            }
+
+            health_check->func = (health_check_func)dlsym(handle, "check_alive");
+            if (health_check->func == NULL) {
+                logError("file: "__FILE__", line: %d, load function check_alive "
+                        "in library %s fail, error info: %s", __LINE__,
+                        health_check->command.argv[0], dlerror());
+                return EFAULT;
+            }
+        } else {
+            health_check->type = hc_type_exec;
+        }
+
+        logDebug("cmd: %s, health check cmd: %s, check type: %d",
+                cpro->commands.list[i].command.cmd, health_check->command.cmd,
+                health_check->type);
     }
 
     return 0;
@@ -1355,7 +1474,14 @@ static int load_from_conf_file(const char* filename)
         check_alive_interval = DEFAULT_CHECK_ALIVE_INTERVAL;
     }
 
+    check_alive_retry_threshold = iniGetIntValue(NULL, "check_alive_retry_threshold",
+            iniContext, DEFAULT_CHECK_ALIVE_RETRY_THRESHOLD);
+    if (check_alive_retry_threshold <= 0) {
+        check_alive_retry_threshold = DEFAULT_CHECK_ALIVE_RETRY_THRESHOLD;
+    }
     enable_access_log = iniGetBoolValue(NULL, "enable_access_log", iniContext, false);
+    takeover_stdout = iniGetBoolValue(NULL, "takeover_stdout", iniContext, true);
+    takeover_stderr = iniGetBoolValue(NULL, "takeover_stderr", iniContext, true);
 
     logfiles_all = malloc(MAX_PATH_SIZE * iniContext->sections.item_count);
     acclogs_all = malloc(MAX_PATH_SIZE * iniContext->sections.item_count);
@@ -1422,7 +1548,7 @@ static int update_process(int pid, const int status)
                     sizeof(ChildProcessInfo *), process_info_cmp_pid);
         }
         if (found == NULL) {
-            logError("file: "__FILE__", line: %d, pid: %d not found",
+            logWarning("file: "__FILE__", line: %d, pid: %d not found",
                     __LINE__, pid);
             return EINVAL;
         } else {
@@ -1444,32 +1570,38 @@ static int update_process(int pid, const int status)
     return 0;
 }
 
-static int start_process(ChildProcessInfo *process)
+static int run_process(ChildProcessInfo *process,
+        CommandParams *command, pid_t *pid)
 {
-    pid_t pid;
-    CommandParams *command;
+    *pid = fork();
+    if (*pid == 0) { //child process
+        if (process->takeover_stdout || process->takeover_stderr) {
+            const char *lfile;
+            int fd;
 
-    command = get_next_command(process);
-    pid = fork();
-    if (pid == 0) { //child process
-        const char *lfile;
-        int fd;
+            lfile = process->logfile;
+            fd = open(lfile, O_APPEND | O_CREAT | O_WRONLY, 0644);
+            umask(022);
+            if (fd < 0) {
+                logError("file: "__FILE__", line: %d, open file %s fail, "
+                        "errno: %d, error info: %s", __LINE__, lfile,
+                        errno, strerror(errno));
+                _exit(1);
+            }
 
-        lfile = process->logfile;
-        fd = open(lfile, O_APPEND | O_CREAT | O_WRONLY, 0644);
-        umask(022);
-        if (fd < 0) {
-            logError("file: "__FILE__", line: %d, open file %s fail, "
-                    "errno: %d, error info: %s", __LINE__, lfile,
-                    errno, strerror(errno));
-            _exit(1);
-        }
+            if (process->takeover_stdout && dup2(fd, 1) < 0) {
+                logError("file: "__FILE__", line: %d, dup2 stdout fail, "
+                        "errno: %d, error info: %s",
+                        __LINE__, errno, strerror(errno));
+                _exit(1);
+            }
 
-        if (dup2(fd, 1) < 0 || dup2(fd, 2) < 0) {
-            logError("file: "__FILE__", line: %d, dup2 fail, "
-                    "errno: %d, error info: %s",
-                    __LINE__, errno, strerror(errno));
-            _exit(1);
+            if (process->takeover_stderr && dup2(fd, 2) < 0) {
+                logError("file: "__FILE__", line: %d, dup2 stderr fail, "
+                        "errno: %d, error info: %s",
+                        __LINE__, errno, strerror(errno));
+                _exit(1);
+            }
         }
         if (execvp(command->argv[0], command->argv) < 0) {
             logError("file: "__FILE__", line: %d, execvp fail, "
@@ -1477,16 +1609,31 @@ static int start_process(ChildProcessInfo *process)
                     __LINE__, errno, strerror(errno));
             _exit(1);
         }
-    } else if (pid < 0) {
+    } else if (*pid < 0) {
         logError("file: "__FILE__", line: %d, fork fail, "
                 "errno: %d, error info: %s",
                 __LINE__, errno, strerror(errno));
-        return errno;
-    } else {
-        process->pid = pid;
+        return errno != 0 ? errno : EACCES;
     }
 
     return 0;
+}
+
+static int start_process(ChildProcessInfo *process)
+{
+    int result;
+    pid_t pid;
+    CommandParams *command;
+
+    command = get_next_command(process);
+    if ((result=run_process(process, command, &pid)) == 0) {
+        process->pid = pid;
+        if (process->check_alive_interval > 0) {
+            process->last_check_alive_time = g_current_time;
+            get_current_command_entry(process)->health_check.fail_count = 0;
+        }
+    }
+    return result;
 }
 
 static int start_all_processes()
@@ -1574,10 +1721,121 @@ static int stop_all_processes()
     return 0;
 }
 
+static int do_check_alive(ChildProcessInfo* child, CommandEntry *cmd_entry)
+{
+    int result;
+    pid_t pid;
+    char output[256];
+    bool ok;
+
+    pid = child->pid;
+    if (pid <= 0) {
+        return ENOENT;
+    }
+
+    if (cmd_entry->health_check.type == hc_type_exec) {
+        if ((result=getExecResult(cmd_entry->health_check.command.cmd,
+                        output, sizeof(output))) != 0)
+        {
+            return result;
+        }
+
+        trim(output);
+        ok = (strcasecmp(output, "OK") == 0);
+        if (!ok) {
+            logError("file: "__FILE__", line: %d, "
+                    "health check fail, cmd: %s, output: %s", __LINE__,
+                    cmd_entry->health_check.command.cmd, output);
+        }
+    } else {
+        result = cmd_entry->health_check.func(cmd_entry->health_check.command.argc,
+                cmd_entry->health_check.command.argv);
+        ok = (result == 0);
+        if (!ok) {
+            logError("file: "__FILE__", line: %d, "
+                    "health check fail, cmd: %s, result: %d", __LINE__,
+                    cmd_entry->health_check.command.cmd, result);
+        }
+    }
+
+    if (ok) {
+        logDebug("file: "__FILE__", line: %d, "
+                "health check for pid %d OK, check cmd: %s", __LINE__,
+                (int)child->pid, cmd_entry->health_check.command.cmd);
+        if (cmd_entry->health_check.fail_count > 0) {
+            cmd_entry->health_check.fail_count = 0;
+        }
+        return 0;
+    }
+
+    cmd_entry->health_check.fail_count++;
+    if (cmd_entry->health_check.fail_count >= child->check_alive_retry_threshold) {
+        if (pid != child->pid) {
+            logInfo("file: "__FILE__", line: %d, "
+                    "pid changed from %d to %d, maybe process: %s restart",
+                    __LINE__, (int)pid, (int)child->pid, cmd_entry->command.cmd);
+        } else if (kill(pid, SIGTERM) == 0) {
+            int i;
+
+            logWarning("file: "__FILE__", line: %d, "
+                    "health check fail count reach %d, kill the process: %s",
+                    __LINE__, child->check_alive_retry_threshold,
+                    cmd_entry->command.cmd);
+            for (i=0; i<5; i++) {
+                if (kill(pid, 0) != 0) {
+                    break;
+                }
+                sleep(1);
+            }
+            if (i == 5) {
+                kill(pid, SIGKILL);
+                logWarning("file: "__FILE__", line: %d, "
+                        "force kill the process: %s",
+                        __LINE__, cmd_entry->command.cmd);
+            }
+        } else {
+            result = errno != 0 ? errno : ESRCH;
+            if (result != ESRCH) {
+                logError("file: "__FILE__", line: %d, "
+                        "kill fail, process: %s, error info: %s ",
+                        __LINE__, cmd_entry->command.cmd, strerror(result));
+            }
+        }
+        cmd_entry->health_check.fail_count = 0;
+    }
+
+    return result;
+}
+
+static void *check_alive_entrance(void *args)
+{
+    ChildProcessInfo *child;
+    CommandEntry *cmd_entry;
+
+    child = (ChildProcessInfo *)args;
+    child->last_check_alive_time = g_current_time;
+
+    while (continue_flag) {
+        sleep(child->check_alive_interval);
+        if (child->last_check_alive_time + child->check_alive_interval > g_current_time) {
+            continue;
+        }
+
+        if (!(child->pid > 0 && child->running)) {
+            continue;
+        }
+
+        cmd_entry = get_current_command_entry(child);
+        do_check_alive(child, cmd_entry);
+        child->last_check_alive_time = g_current_time;
+    }
+
+    return NULL;
+}
+
 static void check_subproccess_alive()
 {
     int i;
-    CommandEntry *cmd_entry;
 
     if (child_running <= 0 || last_check_alive_time >= g_current_time) {
         return;
@@ -1589,24 +1847,23 @@ static void check_subproccess_alive()
         if (!(child->pid > 0 && child->running && child->check_alive_interval > 0)) {
             continue;
         }
+        if (get_current_command_entry(child)->health_check.type != hc_type_kill) {
+            continue;
+        }
 
         if (child->last_check_alive_time + child->check_alive_interval > g_current_time) {
             continue;
         }
 
         child->last_check_alive_time = g_current_time;
-
-        cmd_entry = get_current_command_entry(child);
-        if (cmd_entry->health_check.type == hc_type_kill) {
-            if (kill(child->pid, 0) != 0) {
-                child->running = false;
-                child_running--;
-                logInfo("file: "__FILE__", line: %d, process %d "
-                        "already exited. errno: %d, error info: %s, "
-                        "running %d processes. %s", __LINE__,
-                        child->pid, errno, strerror(errno),
-                        child_running, get_current_command(child));
-            }
+        if (kill(child->pid, 0) != 0) {
+            child->running = false;
+            child_running--;
+            logInfo("file: "__FILE__", line: %d, process %d "
+                    "already exited. errno: %d, error info: %s, "
+                    "running %d processes. %s", __LINE__,
+                    child->pid, errno, strerror(errno),
+                    child_running, get_current_command(child));
         }
     }
 }
