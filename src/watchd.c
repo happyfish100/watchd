@@ -694,7 +694,12 @@ static int add_cron_entry(ChildProcessInfo *process,
 
 static inline bool is_run_by_sh(const char *cmd)
 {
-    return (strchr(cmd, '>') != NULL || cmd[strlen(cmd) - 1] == '&');
+    int cmd_len = strlen(cmd);
+    if (strchr(cmd, '>') != NULL || cmd[cmd_len - 1] == '&') {
+        return true;
+    }
+
+    return (cmd_len > 2 && *cmd == '(' && cmd[cmd_len - 1] == ')');
 }
 
 static int ini_section_load(const int index, const HashData *data, void *args)
