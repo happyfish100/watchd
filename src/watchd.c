@@ -1766,9 +1766,10 @@ static void stop_processes(const StopProcessType stop_type)
             }
         }
     }
-    logInfo("file: "__FILE__", line: %d, all subprocesses stopped. "
+    logInfo("file: "__FILE__", line: %d, all%s subprocesses stopped. "
             "used %"PRId64" ms, child running %d with %d standalone",
-            __LINE__, get_current_time_ms() - start_time,
+            __LINE__, (stop_type == spt_stop_all ? "" : " non-standalone"),
+            get_current_time_ms() - start_time,
             child_running.total, child_running.standalone);
     return;
 }
