@@ -1897,6 +1897,10 @@ void rotate_file(const char* fname)
     char old_filename[MAX_PATH_SIZE];
     int len;
 
+    if (access(fname, F_OK) != 0) {
+        return;
+    }
+
     current_time  = get_current_time() - 60;
     deleted_time = current_time - log_file_keep_days * 86400;
 
@@ -1914,7 +1918,11 @@ void rotate_file(const char* fname)
                 "errno: %d, error info: %s", __LINE__,
                 fname, old_filename, errno, strerror(errno));
     }
-    while(log_file_keep_days) {
+
+    if (log_file_keep_days <= 0) {
+        return;
+    }
+    while (1) {
         struct tm tm2;
         deleted_time -= 86400;
         localtime_r(&deleted_time, &tm2);
@@ -1941,7 +1949,7 @@ static int rotate_logs(void* arg)
     int i;
 
     log_rotate(&g_log_context);
-    if (log_file_keep_days) {
+    if (log_file_keep_days > 0) {
         log_delete_old_files(&g_log_context);
     }
     for (i = 0; i < logfiles_count; i ++) {
