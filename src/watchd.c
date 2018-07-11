@@ -65,6 +65,8 @@ static int load_from_conf_file(const char* filename);
 typedef enum { hc_type_none=0, hc_type_kill,
     hc_type_exec, hc_type_library } HealthCheckType;
 
+typedef enum { spt_stop_all, spt_stop_none_standalone } StopProcessType;
+
 typedef int (*health_check_func)(int argc, char **argv);
 
 typedef struct command_params {
@@ -120,7 +122,10 @@ typedef struct child_process_array {
 
 static struct fast_mblock_man process_mblock;
 static ChildProcessArray child_proc_array = {NULL, 0, 0};
-static int child_running = 0;
+static struct {
+    int total;
+    int standalone;
+} child_running = {0, 0};
 
 static ChildProcessArray cron_proc_array = {NULL, 0, 0};
 
@@ -144,23 +149,31 @@ static int set_command_params(CommandParams *command, const bool enable_access_l
         char *acclog);
 static int process_set_command_params(ChildProcessInfo* cpro);
 
-static void usage(const char* program)
-{
-    printf("usage: %s <config file> [start|stop|restart]\n", program);
-}
-
 static int update_process(int pid, const int status);
 static int check_all_processes();
 static int run_process(ChildProcessInfo *process,
         CommandParams *command, pid_t *pid);
 static int start_all_processes();
-static int stop_all_processes();
+static void stop_processes(const StopProcessType stop_type);
 static int rotate_logs();
 static void check_subproccess_alive();
 static int start_process(ChildProcessInfo *process);
 static int add_shedule_entries();
 static void *check_alive_entrance(void *args);
 static int start_health_check_threads();
+
+#define stop_all_processes() stop_processes(spt_stop_all)
+#define stop_none_standalone_processes() stop_processes(spt_stop_none_standalone)
+
+static void usage(const char* program)
+{
+    printf("usage: %s <config file> [start|stop|restart]\n", program);
+}
+
+static inline bool is_standalone(ChildProcessInfo *child)
+{
+    return !(child->takeover_stdout || child->takeover_stderr);
+}
 
 int main(int argc, char* argv[])
 {
@@ -253,8 +266,8 @@ int main(int argc, char* argv[])
     iniFreeContext(iniContext);
     last_check_alive_time = g_current_time;
     logInfo("file: "__FILE__", line: %d, %s started, "
-            "running processes count: %d",
-            __LINE__, program, child_running);
+            "running processes count: %d, running standalone count: %d",
+            __LINE__, program, child_running.total, child_running.standalone);
 
     //sched_print_all_entries();
     if ((result=start_health_check_threads()) != 0) {
@@ -264,14 +277,14 @@ int main(int argc, char* argv[])
     while (continue_flag) {
         if (restart_subprocess) {
             restart_subprocess = false;
-            stop_all_processes();
+            stop_none_standalone_processes();
         }
         if ((result = check_all_processes()) != 0) {
             return result;
         }
         check_subproccess_alive();
 
-        if (child_running < child_proc_array.count &&
+        if (child_running.total < child_proc_array.count &&
                 (result = start_all_processes()) != 0)
         {
             return result;
@@ -1535,6 +1548,17 @@ static int setup_schedule_tasks()
         64 * 1024, (bool * volatile)&continue_flag);
 }
 
+static inline void do_inc_child_running(ChildProcessInfo *child, const int inc)
+{
+    child_running.total += inc;
+    if (is_standalone(child)) {
+        child_running.standalone += inc;
+    }
+}
+
+#define inc_child_running(child)  do_inc_child_running(child, 1)
+#define dec_child_running(child)  do_inc_child_running(child, -1)
+
 static int update_process(int pid, const int status)
 {
     ChildProcessInfo target;
@@ -1566,12 +1590,12 @@ static int update_process(int pid, const int status)
 
     if ((*found)->running) {
         (*found)->running = false;
-        child_running--;
+        dec_child_running(*found);
     }
     logInfo("file: "__FILE__", line: %d, process %d exit "
-            "with status %d. running %d processes. %s",
-            __LINE__, (*found)->pid, status, child_running,
-            get_current_command(*found));
+            "with status %d. running %d processes with %d standalone. %s",
+            __LINE__, (*found)->pid, status, child_running.total,
+            child_running.standalone, get_current_command(*found));
     return 0;
 }
 
@@ -1655,18 +1679,20 @@ static int start_all_processes()
         {
             result = start_process(child_proc_array.processes[i]);
             if (result != 0) {
-                return result;
+                continue;
             }
 
             child_proc_array.processes[i]->running = true;
             child_proc_array.processes[i]->last_start_time_ms = get_current_time_ms();
-            child_running++;
+            inc_child_running(child_proc_array.processes[i]);
+
             logInfo("file: "__FILE__", line: %d, process %d started%s."
-                    " running %d processes. %s %s",
+                    " running %d processes with %d standalone running. %s %s",
                     __LINE__, child_proc_array.processes[i]->pid,
                     get_current_command_entry(child_proc_array.processes[i])->
                     command.run_by_sh ? "(run by sh -c)" : "",
-                    child_running, get_current_command(child_proc_array.processes[i]),
+                    child_running.total, child_running.standalone,
+                    get_current_command(child_proc_array.processes[i]),
                     child_proc_array.processes[i]->enable_access_log ?
                     child_proc_array.processes[i]->acclog : "");
         }
@@ -1679,51 +1705,72 @@ static int start_all_processes()
     return 0;
 }
 
-static int stop_all_processes()
+static inline int remain_running_count(const StopProcessType stop_type)
+{
+    if (stop_type == spt_stop_all) {
+        return child_running.total;
+    } else {
+        return child_running.total - child_running.standalone;
+    }
+}
+
+static void stop_processes(const StopProcessType stop_type)
 {
     int i;
-    int64_t btime;
+    int64_t start_time;
+    int remain_running;
 
-    btime = get_current_time_ms();
+    start_time = get_current_time_ms();
     for (i = 0; i < child_proc_array.count; i++) {
         ChildProcessInfo* pro = child_proc_array.processes[i];
         if (pro->pid > 0 && pro->running) {
-            kill(pro->pid, SIGTERM);
-        }
-    }
-    for (i = 0; i < wait_subprocess_ms/5 && child_running > 0; i++) {
-        usleep(10*1000);
-        check_all_processes();
-    }
-
-    if (child_running > 0) {
-        for (i = 0; i < child_proc_array.count; i++) {
-            ChildProcessInfo* pro = child_proc_array.processes[i];
-            if (pro->pid > 0 && pro->running) {
-                kill(pro->pid, SIGKILL);
+            if (stop_type == spt_stop_all || !is_standalone(pro)) {
+                kill(pro->pid, SIGTERM);
             }
         }
     }
-    for (i = 0; i < 10 && child_running > 0; i++) {
+    remain_running = remain_running_count(stop_type);
+    for (i = 0; i < wait_subprocess_ms/5 && remain_running > 0; i++) {
         usleep(10*1000);
         check_all_processes();
+        remain_running = remain_running_count(stop_type);
     }
-    if (child_running > 0) {
-        logWarning("file: "__FILE__", line: %d, after sigkill %d "
-                "children still running. ignore",
-                __LINE__, child_running);
+
+    if (remain_running_count(stop_type) > 0) {
         for (i = 0; i < child_proc_array.count; i++) {
             ChildProcessInfo* pro = child_proc_array.processes[i];
             if (pro->pid > 0 && pro->running) {
-                child_proc_array.processes[i]->running = false;
-                child_running--;
+                if (stop_type == spt_stop_all || !is_standalone(pro)) {
+                    kill(pro->pid, SIGKILL);
+                }
+            }
+        }
+    }
+    remain_running = remain_running_count(stop_type);
+    for (i = 0; i < 10 && remain_running > 0; i++) {
+        usleep(10*1000);
+        check_all_processes();
+        remain_running = remain_running_count(stop_type);
+    }
+    if (remain_running_count(stop_type) > 0) {
+        logWarning("file: "__FILE__", line: %d, after sigkill %d "
+                "children still running. ignore",
+                __LINE__, remain_running_count(stop_type));
+        for (i = 0; i < child_proc_array.count; i++) {
+            ChildProcessInfo* pro = child_proc_array.processes[i];
+            if (pro->pid > 0 && pro->running) {
+                if (stop_type == spt_stop_all || !is_standalone(pro)) {
+                    pro->running = false;
+                    dec_child_running(pro);
+                }
             }
         }
     }
     logInfo("file: "__FILE__", line: %d, all subprocesses stopped. "
-            "used %"PRId64" ms, child_running %d", __LINE__,
-            get_current_time_ms() - btime, child_running);
-    return 0;
+            "used %"PRId64" ms, child running %d with %d standalone",
+            __LINE__, get_current_time_ms() - start_time,
+            child_running.total, child_running.standalone);
+    return;
 }
 
 static int do_check_alive(ChildProcessInfo* child, CommandEntry *cmd_entry)
@@ -1786,13 +1833,13 @@ static int do_check_alive(ChildProcessInfo* child, CommandEntry *cmd_entry)
                     "health check fail count reach %d, kill the process: %s",
                     __LINE__, child->check_alive_retry_threshold,
                     cmd_entry->command.cmd);
-            for (i=0; i<5; i++) {
+            for (i=0; i<10; i++) {
                 if (kill(pid, 0) != 0) {
                     break;
                 }
                 sleep(1);
             }
-            if (i == 5) {
+            if (i == 10) {
                 kill(pid, SIGKILL);
                 logWarning("file: "__FILE__", line: %d, "
                         "force kill the process: %s",
@@ -1842,7 +1889,7 @@ static void check_subproccess_alive()
 {
     int i;
 
-    if (child_running <= 0 || last_check_alive_time >= g_current_time) {
+    if (child_running.total <= 0 || last_check_alive_time >= g_current_time) {
         return;
     }
     last_check_alive_time = g_current_time;
@@ -1863,12 +1910,14 @@ static void check_subproccess_alive()
         child->last_check_alive_time = g_current_time;
         if (kill(child->pid, 0) != 0) {
             child->running = false;
-            child_running--;
+            dec_child_running(child);
+
             logInfo("file: "__FILE__", line: %d, process %d "
                     "already exited. errno: %d, error info: %s, "
-                    "running %d processes. %s", __LINE__,
+                    "running %d processes with %d standalone. %s", __LINE__,
                     child->pid, errno, strerror(errno),
-                    child_running, get_current_command(child));
+                    child_running.total, child_running.standalone,
+                    get_current_command(child));
         }
     }
 }
