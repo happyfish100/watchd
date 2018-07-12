@@ -1,0 +1,13 @@
+
+#step 1. download libfastcommon source codes from github and install it,
+   the github address:
+   https://github.com/happyfish100/libfastcommon.git
+
+#step 2. download watched source codes, the github address:
+  https://github.com/happyfish100/watchd.git
+
+#step 3. enter the watchd dir
+cd watchd
+
+#step 4. execute:
+./make.sh && sudo ./make.sh install
