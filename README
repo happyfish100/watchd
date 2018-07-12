@@ -3,3 +3,67 @@ watchd is a process watch dog to keep the watched processes alive.
 
 the sample config file please see src/sample.conf.
 
+config fragment in src/sample.conf:
+
+# one section for a group sub processes
+# you can config more than one sections
+[test1]
+
+# the type: daemon or cron (for crontab)
+# default: daemon
+type = daemon
+
+# the mode: all or failover
+##  all: run all subprocess_command
+##  failover:  run the first command,
+##             run the second command when the first exit,
+##             run the first command again when the last exit,
+##             and so on.
+# default: all
+mode = failover
+
+# the command line of sub process
+# can be a simple command line or a shell command as following three formats:
+##  1. (command)
+##  2. command > output_filename  or   command >> output_filename
+##  3. command &
+## the shell command line while be exec as: sh -c command_line
+subprocess_command = /bin/echo $host_index >> /tmp/echo.log
+
+# check sub process alive interval in seconds
+# 0 for never check
+check_alive_interval = 10
+
+# retry threshold of check alive
+# kill the sub process when the check fail count exceeds this parameter
+# default: 3
+check_alive_retry_threshold = 3
+
+# check_alive_command can be a command or a library whose filename ends with .so)
+## the check command output OK for check passed, others for fail
+#
+## the library must export c function:
+##   int check_alive(int argc, char **argv);
+##   argv[0] is the library filename, argv[1] is the first parameter and so on.
+##   return 0 for success, != 0 for fail.
+##
+## for example:
+##   #@function REPLACE_VARS
+##   check_alive_command = /usr/local/lib/libdfscheckalive.so %{encoder_port} 2 30
+
+#@function REPLACE_VARS
+check_alive_command = echo OK
+
+
+[test2]
+type = cron
+subprocess_command = ls -l / >> /tmp/ls.log
+
+# the time base to schedule
+# this parameter only for cron
+time_base = 00:00
+
+# repeat interval in seconds
+# this parameter only for cron
+repeat_interval = 60
+
