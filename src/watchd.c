@@ -69,6 +69,17 @@ typedef enum { spt_stop_all, spt_stop_none_standalone } StopProcessType;
 
 typedef int (*health_check_func)(int argc, char **argv);
 
+typedef struct env_entry {
+    char *name;
+    char *value;
+} EnvEntry;
+
+typedef struct env_array {
+    EnvEntry *entries;
+    int alloc_size;
+    int count;
+} EnvArray;
+
 typedef struct command_params {
     bool run_by_sh;
     char *cmd;    //command line
@@ -107,6 +118,7 @@ typedef struct child_process_info {
         int index;   //current index
         CommandEntry *list;
     } commands;
+    EnvArray envs;
 } ChildProcessInfo;
 
 typedef struct cron_entry {
@@ -715,6 +727,31 @@ static inline bool is_run_by_sh(const char *cmd)
     return (cmd_len > 2 && *cmd == '(' && cmd[cmd_len - 1] == ')');
 }
 
+static int add_env(EnvArray *envs, const char *name, const char *value)
+{
+    if (envs->alloc_size <= envs->count) {
+        int bytes;
+
+        if (envs->alloc_size == 0) {
+            envs->alloc_size = 4;
+        } else {
+            envs->alloc_size *= 2;
+        }
+        bytes = sizeof(EnvEntry) * envs->alloc_size;
+        envs->entries = (EnvEntry *)realloc(envs->entries, bytes);
+        if (envs->entries == NULL) {
+            logError("file: "__FILE__", line: %d, malloc %d bytes fail",
+                    __LINE__, bytes);
+            return ENOMEM;
+        }
+    }
+
+    envs->entries[envs->count].name = strdup(name);
+    envs->entries[envs->count].value = strdup(value);
+    envs->count++;
+    return 0;
+}
+
 static int ini_section_load(const int index, const HashData *data, void *args)
 {
     IniSection *pSection;
@@ -722,6 +759,8 @@ static int ini_section_load(const int index, const HashData *data, void *args)
     IniItem *pItemEnd;
     char section_name[256];
     int section_len;
+    EnvArray envs = {NULL, 0, 0};
+    int result;
     int i;
 
     pSection = (IniSection *)data->value;
@@ -796,6 +835,19 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 }
             } else if (strcmp(pItem->name, "enable_access_log") == 0) {
                 enableAccessLog = FAST_INI_STRING_IS_TRUE(pItem->value);
+            } else if (strcmp(pItem->name, "set_env") == 0) {
+                char buff[FAST_INI_ITEM_VALUE_SIZE];
+                char *cols[2];
+                snprintf(buff, sizeof(buff), "%s", pItem->value);
+                if (splitEx(buff, '=', cols, 2) != 2) {
+                    logError("file: "__FILE__", line: %d, "
+                            "invalid env pair: %s, correct format: name=value",
+                            __LINE__, pItem->value);
+                    return EINVAL;
+                }
+                if ((result=add_env(&envs, cols[0], cols[1])) != 0) {
+                    return result;
+                }
             }
         }
 
@@ -831,6 +883,7 @@ static int ini_section_load(const int index, const HashData *data, void *args)
             cpro->enable_access_log = enableAccessLog;
             cpro->takeover_stdout = new_takeover_stdout;
             cpro->takeover_stderr = new_takeover_stderr;
+            cpro->envs = envs;
             return add_cron_entry(cpro, time_base, repeat_interval);
         }
 
@@ -869,6 +922,7 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 cpro->enable_access_log = enableAccessLog;
                 cpro->takeover_stdout = new_takeover_stdout;
                 cpro->takeover_stderr = new_takeover_stderr;
+                cpro->envs = envs;
             }
             logfiles_count++;
         } else {
@@ -1020,10 +1074,14 @@ static int expand_cmd(ChildProcessInfo *cpro,
     sprintf(pword, "%.*s", word_len, pdollar + 1);
     confArgs = iniGetStrValue(NULL, pword, iniContext);
     if (confArgs == NULL) {
-        logError("file: "__FILE__", line: %d, no conf word for "
+        logWarning("file: "__FILE__", line: %d, no conf word for "
                 "%s in global section. in cmd: %s",
                 __LINE__, pword, cmd);
-        return EINVAL;
+        if (processes != NULL) {
+            processes[0] = cpro;
+            *pnum = 1;
+        }
+        return 0;
     }
     if ((int)strlen(confArgs) >= (int)sizeof(args)) {
         logError("file: "__FILE__", line: %d, the value of "
@@ -1630,6 +1688,13 @@ static int run_process(ChildProcessInfo *process,
                         "errno: %d, error info: %s",
                         __LINE__, errno, strerror(errno));
                 _exit(1);
+            }
+        }
+        if (process->envs.count > 0) {
+            int i;
+            for (i=0; i<process->envs.count; i++) {
+                setenv(process->envs.entries[i].name,
+                        process->envs.entries[i].value, 1);
             }
         }
         if (execvp(command->argv[0], command->argv) < 0) {
