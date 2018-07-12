@@ -845,7 +845,7 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                             __LINE__, pItem->value);
                     return EINVAL;
                 }
-                if ((result=add_env(&envs, cols[0], cols[1])) != 0) {
+                if ((result=add_env(&envs, trim(cols[0]), trim(cols[1]))) != 0) {
                     return result;
                 }
             }
