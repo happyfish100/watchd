@@ -1048,41 +1048,51 @@ static int expand_cmd(ChildProcessInfo *cpro,
 
     cmd = cpro->commands.list[0].command.cmd;
     cmd_len = strlen(cmd);
-    pdollar = (char*)strchr(cmd, '$');
-    if (pdollar == NULL) { //no need to expand
-        if (processes != NULL) {
-            processes[0] = cpro;
-            *pnum = 1;
+    pdollar = cmd;
+    while (1) {
+        pdollar = (char*)strchr(pdollar, '$');
+        if (pdollar == NULL) { //no need to expand
+            if (processes != NULL) {
+                processes[0] = cpro;
+                *pnum = 1;
+            }
+            return 0;
         }
-        return 0;
-    }
-    pworde = pdollar + 1;
-    while (*pworde != '\0' && !isspace(*pworde)) {
-        pworde++;
+
+        pworde = pdollar + 1;
+        while (*pworde != '\0' && ((*pworde >= 'a' && *pworde <= 'z') ||
+                    (*pworde >= 'A' && *pworde <= 'Z') ||
+                    (*pworde >= '0' && *pworde <= '9') ||
+                    (*pworde >= '_') || (*pworde == '-') ||
+                    (*pworde >= '.')))
+        {
+            pworde++;
+        }
+
+        tail = pworde;
+        word_len = pworde - (pdollar + 1);
+        if (word_len >= sizeof(pword)) {
+            logError("file: "__FILE__", line: %d, key length "
+                    "too long, exceeds %d, key: %.*s. in cmd: %s",
+                    __LINE__, (int)sizeof(pword), word_len,
+                    pdollar + 1, cmd);
+            pdollar = pworde;
+            continue;
+        }
+
+        sprintf(pword, "%.*s", word_len, pdollar + 1);
+        confArgs = iniGetStrValue(NULL, pword, iniContext);
+        if (confArgs == NULL) {
+            logWarning("file: "__FILE__", line: %d, no conf word for "
+                    "%s in global section. in cmd: %s",
+                    __LINE__, pword, cmd);
+            pdollar = pworde;
+            continue;
+        }
+
+        break;
     }
 
-    tail = pworde;
-    word_len = pworde - (pdollar + 1);
-    if (word_len >= sizeof(pword)) {
-        logError("file: "__FILE__", line: %d, key length "
-                "too long, exceeds %d, key: %.*s. in cmd: %s",
-                __LINE__, (int)sizeof(pword), word_len,
-                pdollar + 1, cmd);
-        return EINVAL;
-    }
-
-    sprintf(pword, "%.*s", word_len, pdollar + 1);
-    confArgs = iniGetStrValue(NULL, pword, iniContext);
-    if (confArgs == NULL) {
-        logWarning("file: "__FILE__", line: %d, no conf word for "
-                "%s in global section. in cmd: %s",
-                __LINE__, pword, cmd);
-        if (processes != NULL) {
-            processes[0] = cpro;
-            *pnum = 1;
-        }
-        return 0;
-    }
     if ((int)strlen(confArgs) >= (int)sizeof(args)) {
         logError("file: "__FILE__", line: %d, the value of "
                 "%s in global section is too long",

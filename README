@@ -22,13 +22,17 @@ type = daemon
 # default: all
 mode = failover
 
+# set environment variable
+# can ocur more than once
+set_env = OMP_NUM_THREADS=4
+
 # the command line of sub process
 # can be a simple command line or a shell command as following three formats:
 ##  1. (command)
 ##  2. command > output_filename  or   command >> output_filename
 ##  3. command &
 ## the shell command line while be exec as: sh -c command_line
-subprocess_command = /bin/echo $host_index >> /tmp/echo.log
+subprocess_command = /bin/echo OMP_NUM_THREADS=$OMP_NUM_THREADS $host_index >> /tmp/echo.log
 
 # check sub process alive interval in seconds
 # 0 for never check
@@ -39,7 +43,7 @@ check_alive_interval = 10
 # default: 3
 check_alive_retry_threshold = 3
 
-# check_alive_command can be a command or a library whose filename ends with .so)
+# check_alive_command can be a command or a library whose filename ends with .so
 ## the check command output OK for check passed, others for fail
 #
 ## the library must export c function:
