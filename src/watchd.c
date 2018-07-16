@@ -18,6 +18,7 @@
 #include "fastcommon/process_ctrl.h"
 #include "fastcommon/ini_file_reader.h"
 #include "fastcommon/pthread_func.h"
+#include "fastcommon/common_blocked_queue.h"
 
 #define MAX_CRON_PROCESS_PER_ENTRY         64
 #define DEFAULT_WAIT_SUBPROCESS           300
@@ -65,7 +66,13 @@ static int load_from_conf_file(const char* filename);
 typedef enum { hc_type_none=0, hc_type_kill,
     hc_type_exec, hc_type_library } HealthCheckType;
 
-typedef enum { spt_stop_all, spt_stop_none_standalone } StopProcessType;
+typedef enum {
+    spt_stop_all,
+    spt_stop_none_standalone,
+    spt_stop_force_restart
+} StopProcessType;
+
+typedef enum { rbst_true, rbst_false, rbst_auto} RunByShType;
 
 typedef int (*health_check_func)(int argc, char **argv);
 
@@ -104,12 +111,14 @@ typedef struct child_process_info {
     bool enable_access_log;
     bool takeover_stdout;
     bool takeover_stderr;
+    bool force_restart_flag;
     int64_t last_start_time_ms;
     int last_check_alive_time;
     int restart_interval_ms;
     int check_alive_interval;
     int check_alive_retry_threshold;
-    uint32_t run_count;
+    int force_restart_interval;
+    uint32_t run_count;        //run times counter
     char *logfile;
     char *acclog;
     struct command_array {
@@ -137,7 +146,11 @@ static ChildProcessArray child_proc_array = {NULL, 0, 0};
 static struct {
     int total;
     int standalone;
-} child_running = {0, 0};
+    int force_restart;
+} child_running = {0, 0, 0};
+
+static struct common_blocked_queue force_restart_queue;
+static time_t last_deal_force_restart_time;
 
 static ChildProcessArray cron_proc_array = {NULL, 0, 0};
 
@@ -170,12 +183,15 @@ static void stop_processes(const StopProcessType stop_type);
 static int rotate_logs();
 static void check_subproccess_alive();
 static int start_process(ChildProcessInfo *process);
-static int add_shedule_entries();
+static int add_force_restart_shedule_entries();
+static int add_cron_shedule_entries();
 static void *check_alive_entrance(void *args);
 static int start_health_check_threads();
+static void deal_force_restart_queue();
 
 #define stop_all_processes() stop_processes(spt_stop_all)
 #define stop_none_standalone_processes() stop_processes(spt_stop_none_standalone)
+#define stop_force_restart_processes() stop_processes(spt_stop_force_restart)
 
 static void usage(const char* program)
 {
@@ -204,6 +220,9 @@ int main(int argc, char* argv[])
     if ((result=fast_mblock_init_ex(&process_mblock,
                     sizeof(ChildProcessInfo), 256, NULL, false)) != 0)
     {
+        return result;
+    }
+    if ((result=common_blocked_queue_init_ex(&force_restart_queue, 128)) != 0) {
         return result;
     }
 
@@ -268,7 +287,10 @@ int main(int argc, char* argv[])
     setup_sig_handlers();
     setup_schedule_tasks();
 
-    if ((result=add_shedule_entries()) != 0) {
+    if ((result=add_force_restart_shedule_entries()) != 0) {
+        return result;
+    }
+    if ((result=add_cron_shedule_entries()) != 0) {
         return result;
     }
     if ((result = start_all_processes()) != 0) {
@@ -281,16 +303,22 @@ int main(int argc, char* argv[])
             "running processes count: %d, running standalone count: %d",
             __LINE__, program, child_running.total, child_running.standalone);
 
-    //sched_print_all_entries();
+    if (g_log_context.log_level >= LOG_DEBUG) {
+        sched_print_all_entries();
+    }
     if ((result=start_health_check_threads()) != 0) {
         continue_flag = false;
     }
+
+    last_deal_force_restart_time = g_current_time;
 
     while (continue_flag) {
         if (restart_subprocess) {
             restart_subprocess = false;
             stop_none_standalone_processes();
         }
+        deal_force_restart_queue();
+
         if ((result = check_all_processes()) != 0) {
             return result;
         }
@@ -503,6 +531,21 @@ static int schedule_task_func(void *args)
     return 0;
 }
 
+static int force_restart_func(void *args)
+{
+    ChildProcessInfo *process;
+    process = (ChildProcessInfo *)args;
+
+    logInfo("file: "__FILE__", line: %d, restart process%s: %s %s",
+            __LINE__, get_current_command_entry(process)->command.run_by_sh ?
+            "(run by sh -c)" : "", get_current_command(process),
+            process->enable_access_log ? process->acclog : "");
+    if (!process->force_restart_flag) {
+        common_blocked_queue_push(&force_restart_queue, process);
+    }
+    return 0;
+}
+
 static int start_health_check_threads()
 {
     ChildProcessInfo **child;
@@ -622,7 +665,7 @@ static int check_alloc_schedule_entries(ScheduleArray *pSheduleArray,
     return 0;
 }
 
-static int add_shedule_entries()
+static int add_cron_shedule_entries()
 {
     ChildProcessInfo *cron_processes[MAX_CRON_PROCESS_PER_ENTRY];
     ChildProcessInfo *process;
@@ -684,6 +727,42 @@ static int add_shedule_entries()
     return 0;
 }
 
+static int add_force_restart_shedule_entries()
+{
+    ChildProcessInfo **child;
+    ChildProcessInfo **end;
+    ScheduleEntry *pScheduleEntry;
+    ScheduleArray shedule_array = {NULL, 0};
+    int result;
+    int alloc_size = 0;
+
+    end = child_proc_array.processes + child_proc_array.count;
+    for (child=child_proc_array.processes; child<end; child++) {
+        if ((*child)->force_restart_interval <= 0) {
+            continue;
+        }
+
+        if ((result=check_alloc_schedule_entries(&shedule_array,
+                        &alloc_size, 1)) != 0)
+        {
+            return result;
+        }
+
+        pScheduleEntry = shedule_array.entries + shedule_array.count;
+        INIT_SCHEDULE_ENTRY((*pScheduleEntry), sched_generate_next_id(),
+                0, 0, 0, (*child)->force_restart_interval,
+                force_restart_func, *child);
+        shedule_array.count++;
+    }
+
+    if (shedule_array.count > 0 && (result=sched_add_entries(&shedule_array)) != 0) {
+        return result;
+    }
+
+    free(shedule_array.entries);
+    return 0;
+}
+
 static int add_cron_entry(ChildProcessInfo *process,
         const char *time_base, const int interval)
 {
@@ -720,11 +799,22 @@ static int add_cron_entry(ChildProcessInfo *process,
 static inline bool is_run_by_sh(const char *cmd)
 {
     int cmd_len = strlen(cmd);
-    if (strchr(cmd, '>') != NULL || cmd[cmd_len - 1] == '&') {
+    if (strchr(cmd, '>') != NULL || strchr(cmd, '|') != NULL ||
+            cmd[cmd_len - 1] == '&')
+    {
         return true;
     }
 
     return (cmd_len > 2 && *cmd == '(' && cmd[cmd_len - 1] == ')');
+}
+
+static inline bool calc_run_by_sh(RunByShType run_by_sh, const char *cmd)
+{
+    if (run_by_sh == rbst_auto) {
+        return is_run_by_sh(cmd);
+    } else {
+        return run_by_sh == rbst_true;
+    }
 }
 
 static int add_env(EnvArray *envs, const char *name, const char *value)
@@ -788,6 +878,8 @@ static int ini_section_load(const int index, const HashData *data, void *args)
         int new_check_alive_retry_threshold = check_alive_retry_threshold;
         int new_takeover_stdout = takeover_stdout;
         int new_takeover_stderr = takeover_stderr;
+        int force_restart_interval = 0;
+        RunByShType run_by_sh = rbst_auto;
         int repeat_interval;
         bool enableAccessLog = enable_access_log;
 
@@ -807,6 +899,8 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 new_restart_interval_ms = atoi(pItem->value);
             } else if (strcmp(pItem->name, "check_alive_interval") == 0) {
                 new_check_alive_interval = atoi(pItem->value);
+            } else if (strcmp(pItem->name, "force_restart_interval") == 0) {
+                force_restart_interval = atoi(pItem->value);
             } else if (strcmp(pItem->name, "check_alive_retry_threshold") == 0) {
                 new_check_alive_retry_threshold = atoi(pItem->value);
                 if (new_check_alive_retry_threshold <= 0) {
@@ -820,6 +914,13 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 check_alive_command = pItem->value;
             } else if (strcmp(pItem->name, "type") == 0) {
                 type = pItem->value;
+            } else if (strcmp(pItem->name, "run_by_sh") == 0) {
+                if (strcasecmp(pItem->value, "auto") == 0) {
+                    run_by_sh = rbst_auto;
+                } else {
+                    run_by_sh = FAST_INI_STRING_IS_TRUE(pItem->value) ?
+                        rbst_true : rbst_false;
+                }
             } else if (strcmp(pItem->name, "mode") == 0) {
                 mode = pItem->value;
             } else if (strcmp(pItem->name, "time_base") == 0) {
@@ -874,7 +975,8 @@ static int ini_section_load(const int index, const HashData *data, void *args)
             if (check_alloc_command_array(&cpro->commands, 1) != 0) {
                 return ENOMEM;
             }
-            cpro->commands.list[0].command.run_by_sh = is_run_by_sh(cmd);
+            cpro->commands.list[0].command.run_by_sh = calc_run_by_sh(
+                    run_by_sh, cmd);
             cpro->commands.list[0].command.cmd = strdup(cmd);
             cpro->commands.count = 1;
             cpro->logfile = strdup(logfiles_all[logfiles_count]);
@@ -903,7 +1005,8 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 } else {
                     cpro->mode = MODE_ALL;
                 }
-                cpro->commands.list[0].command.run_by_sh = is_run_by_sh(cmd);
+                cpro->commands.list[0].command.run_by_sh = calc_run_by_sh(
+                        run_by_sh, cmd);
                 cpro->commands.list[0].command.cmd = strdup(cmd);
 
                 if (new_check_alive_interval > 0) {
@@ -912,6 +1015,15 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                             strdup(check_alive_command);
                     }
                 }
+                if (force_restart_interval > 0 && force_restart_interval <
+                        new_restart_interval_ms / 1000)
+                {
+                    logWarning("file: "__FILE__", line: %d, "
+                            "force_restart_interval: %d < restart_interval: %d, "
+                            " set to restart_interval", __LINE__,
+                            force_restart_interval, new_restart_interval_ms / 1000);
+                    force_restart_interval = new_restart_interval_ms / 1000;
+                }
 
                 cpro->commands.count = 1;
                 cpro->logfile = logfiles_all[logfiles_count];
@@ -919,6 +1031,7 @@ static int ini_section_load(const int index, const HashData *data, void *args)
                 cpro->restart_interval_ms = new_restart_interval_ms;
                 cpro->check_alive_interval = new_check_alive_interval;
                 cpro->check_alive_retry_threshold = new_check_alive_retry_threshold;
+                cpro->force_restart_interval = force_restart_interval;
                 cpro->enable_access_log = enableAccessLog;
                 cpro->takeover_stdout = new_takeover_stdout;
                 cpro->takeover_stderr = new_takeover_stderr;
@@ -1625,7 +1738,15 @@ static inline void do_inc_child_running(ChildProcessInfo *child, const int inc)
 }
 
 #define inc_child_running(child)  do_inc_child_running(child, 1)
-#define dec_child_running(child)  do_inc_child_running(child, -1)
+
+static inline void dec_child_running(ChildProcessInfo *child)
+{
+    do_inc_child_running(child, -1);
+    if (child->force_restart_flag) {
+        child->force_restart_flag = false;
+        child_running.force_restart--;
+    }
+}
 
 static int update_process(int pid, const int status)
 {
@@ -1784,22 +1905,30 @@ static inline int remain_running_count(const StopProcessType stop_type)
 {
     if (stop_type == spt_stop_all) {
         return child_running.total;
-    } else {
+    } else if (stop_type == spt_stop_none_standalone) {
         return child_running.total - child_running.standalone;
+    }else {
+        return child_running.force_restart;
     }
 }
 
 static void stop_processes(const StopProcessType stop_type)
 {
+#define NEED_KILL_PROCESS(stop_type, pro) \
+    ((stop_type == spt_stop_all) || \
+     (stop_type == spt_stop_none_standalone && !is_standalone(pro)) || \
+     (stop_type == spt_stop_force_restart && pro->force_restart_flag))
+
     int i;
     int64_t start_time;
+    char *prompt;
     int remain_running;
 
     start_time = get_current_time_ms();
     for (i = 0; i < child_proc_array.count; i++) {
         ChildProcessInfo* pro = child_proc_array.processes[i];
         if (pro->pid > 0 && pro->running) {
-            if (stop_type == spt_stop_all || !is_standalone(pro)) {
+            if (NEED_KILL_PROCESS(stop_type, pro)) {
                 kill(pro->pid, SIGTERM);
             }
         }
@@ -1834,17 +1963,25 @@ static void stop_processes(const StopProcessType stop_type)
         for (i = 0; i < child_proc_array.count; i++) {
             ChildProcessInfo* pro = child_proc_array.processes[i];
             if (pro->pid > 0 && pro->running) {
-                if (stop_type == spt_stop_all || !is_standalone(pro)) {
+                if (NEED_KILL_PROCESS(stop_type, pro)) {
+                    pro->pid = 0;
                     pro->running = false;
                     dec_child_running(pro);
                 }
             }
         }
     }
+
+    if (stop_type == spt_stop_all) {
+        prompt = "";
+    } else {
+        prompt = (stop_type == spt_stop_none_standalone) ?
+            " non-standalone" : " force restart";
+    }
+
     logInfo("file: "__FILE__", line: %d, all%s subprocesses stopped. "
             "used %"PRId64" ms, child running %d with %d standalone",
-            __LINE__, (stop_type == spt_stop_all ? "" : " non-standalone"),
-            get_current_time_ms() - start_time,
+            __LINE__, prompt, get_current_time_ms() - start_time,
             child_running.total, child_running.standalone);
     return;
 }
@@ -2085,4 +2222,35 @@ static int rotate_logs(void* arg)
     }
     restart_subprocess = true;
     return 0;
+}
+
+
+static void deal_force_restart_queue()
+{
+    ChildProcessInfo *child;
+
+    if (g_current_time - last_deal_force_restart_time < 1) {
+        return;
+    }
+    last_deal_force_restart_time = g_current_time;
+
+    child_running.force_restart = 0;
+    while ((child=(ChildProcessInfo *)common_blocked_queue_try_pop(
+                    &force_restart_queue)) != NULL)
+    {
+        if ((child->pid > 0 && child->running) &&
+                (get_current_time_ms() - child->last_start_time_ms >
+                child->restart_interval_ms))
+        {
+            child->force_restart_flag = true;
+            child_running.force_restart++;
+        }
+    }
+
+    if (child_running.force_restart > 0) {
+        logDebug("file: "__FILE__", line: %d, "
+                "force restart count: %d", __LINE__,
+                child_running.force_restart);
+        stop_force_restart_processes();
+    }
 }
