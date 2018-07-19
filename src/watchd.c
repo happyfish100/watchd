@@ -750,7 +750,7 @@ static int add_force_restart_shedule_entries()
 
         pScheduleEntry = shedule_array.entries + shedule_array.count;
         INIT_SCHEDULE_ENTRY((*pScheduleEntry), sched_generate_next_id(),
-                0, 0, 0, (*child)->force_restart_interval,
+                23, 59, 30, (*child)->force_restart_interval,
                 force_restart_func, *child);
         shedule_array.count++;
     }
@@ -1714,13 +1714,8 @@ static int setup_schedule_tasks()
     pEntry = scheduleEntries;
     memset(scheduleEntries, 0, sizeof(scheduleEntries));
 
-    pEntry->id = sched_generate_next_id();
-    pEntry->time_base.hour = 0;
-    pEntry->time_base.minute = 0;
-    pEntry->time_base.second = 0;
-    pEntry->interval = 86400;
-    pEntry->task_func = rotate_logs;
-    pEntry->func_args = NULL;
+    INIT_SCHEDULE_ENTRY((*pEntry), sched_generate_next_id(),
+            0, 0, 0, 86400, rotate_logs, NULL);
     pEntry++;
 
     scheduleArray.entries = scheduleEntries;
